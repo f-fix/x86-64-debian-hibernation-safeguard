@@ -141,7 +141,6 @@ def cleanup_legacy_artifacts():
                 f"Warning: could not remove directory {legacy_run_dir}: {e}\n"
             )
 
-    # Purge any legacy modules sentinel comments
     modules_file = Path("/etc/initramfs-tools/modules")
     if modules_file.exists():
         content = modules_file.read_text()
@@ -151,7 +150,6 @@ def cleanup_legacy_artifacts():
             modules_file.write_text(content)
             print("Purged legacy sentinel comments from /etc/initramfs-tools/modules")
 
-    # Purge any legacy GRUB 40_custom sentinel comments
     custom_path = Path("/etc/grub.d/40_custom")
     if custom_path.exists():
         content = custom_path.read_text()
@@ -208,7 +206,6 @@ def configure_initramfs_framework(installer_name=INSTALLER_NAME):
         f"### END HIBERNATION SAFEGUARD MODULES (installed by {installer_name}) ###"
     )
 
-    # Strip any existing sentinel blocks (past or present)
     pat = r"### BEGIN (?:GPD )?HIBERNATION SAFEGUARD MODULES[^\n]*\n.*?### END (?:GPD )?HIBERNATION SAFEGUARD MODULES[^\n]*(?:\n|$)"
     base_content = re.sub(pat, "", content, flags=re.DOTALL)
 
@@ -262,7 +259,6 @@ case "$1" in
         ;;
 esac
 
-# Helper to verify permanent hardware MAC (rejects randomized / locally-administered / multicast)
 is_permanent_hw_mac() {
     _mac="$1"
     case "$_mac" in
@@ -430,7 +426,6 @@ if [ "$1" = "pre" ] && [ "$2" = "hibernate" ]; then
 
     if [ "$FAILED_UNMOUNT" = true ]; then
         echo "CRITICAL: Aborting hibernation to prevent filesystem corruption!" >&2
-        # Remount any partially unmounted filesystems
         mount /boot 2>/dev/null || true
         mount /boot/efi 2>/dev/null || true
         mount -a 2>/dev/null || true
@@ -613,7 +608,6 @@ SAVED_MAC=""
 SAVED_MAC_IFACE=""
 SAVED_KERNEL=""
 
-# Mount /boot STRICTLY read-only to read target state, then UNMOUNT IMMEDIATELY.
 if [ -n "$BOOT_DEV" ] && mount -o ro "$BOOT_DEV" "$BOOT_MNT" 2>/dev/null; then
     if [ -f "$BOOT_MNT/initramfs_hib_id" ]; then
         . "$BOOT_MNT/initramfs_hib_id"
@@ -974,31 +968,31 @@ def compile_images(has_grub):
     run_command(["update-initramfs", "-u", "-k", "all"], capture_output=False)
 
 
-def install():
+def install(installer_name=INSTALLER_NAME):
     check_root()
-    print(f"=== Deploying Hardware Hibernation Safeguard via {INSTALLER_NAME} ===")
+    print(f"=== Deploying Hardware Hibernation Safeguard via {installer_name} ===")
     print(
         "Note: Tested so far on Debian Forky/Sid (Debian 14 / unstable); should work on other x86-64 Debian flavors."
     )
     print()
     cleanup_legacy_artifacts()
     boot_dev, boot_uuid, has_grub, has_systemd_boot, esp_dir = gather_machine_layout()
-    configure_initramfs_framework(INSTALLER_NAME)
-    write_machine_id_helper(INSTALLER_NAME)
-    write_systemd_sleep_hook(INSTALLER_NAME)
+    configure_initramfs_framework(installer_name)
+    write_machine_id_helper(installer_name)
+    write_systemd_sleep_hook(installer_name)
     if has_grub:
-        write_grub_hooks(boot_uuid, INSTALLER_NAME)
-    write_initramfs_hook(boot_uuid, INSTALLER_NAME)
+        write_grub_hooks(boot_uuid, installer_name)
+    write_initramfs_hook(boot_uuid, installer_name)
     compile_images(has_grub)
     print("=== SUCCESS ===")
-    print(f"Hardware Hibernation Safeguard fully provisioned by {INSTALLER_NAME}.")
+    print(f"Hardware Hibernation Safeguard fully provisioned by {installer_name}.")
     print(
         "System will dynamically enforce correct kernel targets on both bootloaders without syntax bugs."
     )
 
 
-def show_status():
-    print(f"=== Hardware Hibernation Safeguard Status ({INSTALLER_NAME}) ===")
+def show_status(installer_name=INSTALLER_NAME):
+    print(f"=== Hardware Hibernation Safeguard Status ({installer_name}) ===")
     print(
         "Note: Tested so far on Debian Forky/Sid (Debian 14 / unstable); should work on other x86-64 Debian flavors."
     )
@@ -1178,9 +1172,9 @@ def main():
     args = parser.parse_args()
 
     if args.install:
-        install()
+        install(INSTALLER_NAME)
     elif args.status:
-        show_status()
+        show_status(INSTALLER_NAME)
 
 
 if __name__ == "__main__":
