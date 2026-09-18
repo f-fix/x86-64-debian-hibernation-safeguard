@@ -17,7 +17,11 @@ Non-clobbering configuration integration with sentinel markers.
 Automatic cleanup of legacy artifacts and past guard comments from previous iterations.
 Automatic privilege self-elevation (sudo/doas/pkexec).
 Strict isolation of /boot and /boot/efi to eliminate post-resume filesystem corruption.
-Comprehensive DMI/SMBIOS (vendor/model/bios/board/cpu) cross-validation across GRUB and initramfs without generic field filtering.
+Comprehensive DMI/SMBIOS (vendor/model/bios/board/cpu) cross-validation across GRUB and initramfs.
+Standard SMBIOS byte-offset retrieval in GRUB with automatic skip on unretrievable/empty fields.
+GRUB mismatch screen with 30-second interruptible reading pause and display of changed fields only.
+Functional GRUB menu entries with full kernel/initrd parameters and explicit boot commands.
+Automatic cleanup service guaranteeing deletion of leftover hibernation files on every normal (non-resume) boot.
 Seamless kernel rollback/override handling on systemd-boot and GRUB during hibernation resume with automatic restoration for future boots.
 Strict bootloader isolation ensuring systemd-boot never hijacks resumption if the current session booted via GRUB or other loaders.
 Robust physical MAC address discovery supporting Ethernet, Wi-Fi, and userspace-configured links with IEEE 802 universal/local bit validation.
@@ -169,21 +173,39 @@ def cleanup_legacy_artifacts():
 
 def gather_machine_layout():
     print("=== 1. Gathering Machine Layout Details ===")
-    res = run_command(["df", "/boot"], capture_output=True)
-    lines = res.stdout.strip().splitlines()
-    if len(lines) < 2:
+    res_boot = run_command(["df", "/boot"], capture_output=True)
+    lines_boot = res_boot.stdout.strip().splitlines()
+    if len(lines_boot) < 2:
         sys.stderr.write("ERROR: Could not resolve block device for /boot\n")
         sys.exit(1)
-    boot_dev = lines[1].split()[0]
+    boot_dev = lines_boot[1].split()[0]
 
-    res_uuid = run_command(
-        ["blkid", "-s", "UUID", "-o", "value", boot_dev], capture_output=True
-    )
-    boot_uuid = res_uuid.stdout.strip()
-    if not boot_uuid:
-        sys.stderr.write(f"ERROR: Could not fetch UUID for device {boot_dev}\n")
+    res_root = run_command(["df", "/"], capture_output=True)
+    lines_root = res_root.stdout.strip().splitlines()
+    if len(lines_root) < 2:
+        sys.stderr.write("ERROR: Could not resolve block device for /\n")
         sys.exit(1)
-    print(f"Resolved /boot partition at {boot_dev} with UUID: {boot_uuid}")
+    root_dev = lines_root[1].split()[0]
+
+    res_boot_uuid = run_command(
+        ["blkid", "-s", "UUID", "-o", "value", boot_dev],
+        check=False,
+        capture_output=True,
+    )
+    boot_uuid = res_boot_uuid.stdout.strip()
+    if not boot_uuid:
+        boot_uuid = ""
+
+    res_root_uuid = run_command(
+        ["blkid", "-s", "UUID", "-o", "value", root_dev],
+        check=False,
+        capture_output=True,
+    )
+    root_uuid = res_root_uuid.stdout.strip()
+
+    is_separate_boot = (boot_dev != root_dev) and (Path("/boot").is_mount())
+    kernel_dir = "" if is_separate_boot else "/boot"
+    root_spec = f"UUID={root_uuid}" if root_uuid else root_dev
 
     has_grub = Path("/etc/grub.d").is_dir() and shutil.which("update-grub") is not None
 
@@ -195,8 +217,22 @@ def gather_machine_layout():
             esp_dir = path
             break
 
+    print(
+        f"Resolved /boot partition at {boot_dev} (UUID: {boot_uuid or 'unknown'}, separate: {is_separate_boot})"
+    )
+    print(f"Resolved / (root) partition at {root_dev} (root_spec: {root_spec})")
     print(f"Detection Results -> GRUB: {has_grub} | systemd-boot: {has_systemd_boot}")
-    return boot_dev, boot_uuid, has_grub, has_systemd_boot, esp_dir
+    return (
+        boot_dev,
+        boot_uuid,
+        root_dev,
+        root_uuid,
+        root_spec,
+        kernel_dir,
+        has_grub,
+        has_systemd_boot,
+        esp_dir,
+    )
 
 
 def configure_initramfs_framework(installer_name=INSTALLER_NAME):
@@ -571,7 +607,43 @@ fi
     hook_path.chmod(0o755)
 
 
-def write_grub_hooks(boot_uuid, installer_name=INSTALLER_NAME):
+def write_boot_cleanup_service(installer_name=INSTALLER_NAME):
+    print("=== 4b. Setting up Boot Target Cleanup Service (Normal Boot Cleanup) ===")
+    service_path = Path("/lib/systemd/system/hibernation-safeguard-cleanup.service")
+    service_path.parent.mkdir(parents=True, exist_ok=True)
+    content = f"""[Unit]
+Description=Hibernation Safeguard Target Cleanup on Normal Boot
+Documentation=https://github.com/f-fix/x86-64-debian-hibernation-safeguard
+DefaultDependencies=no
+After=local-fs.target
+Before=basic.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hibernation-machine-id clear-targets
+RemainAfterExit=yes
+
+[Install]
+WantedBy=basic.target
+"""
+    service_path.write_text(content)
+    service_path.chmod(0o644)
+
+    wants_dir = Path("/etc/systemd/system/basic.target.wants")
+    wants_dir.mkdir(parents=True, exist_ok=True)
+    wants_link = wants_dir / "hibernation-safeguard-cleanup.service"
+    if wants_link.exists() or wants_link.is_symlink():
+        try:
+            wants_link.unlink()
+        except OSError:
+            pass
+    try:
+        wants_link.symlink_to(service_path)
+    except OSError:
+        pass
+
+
+def write_grub_hooks(boot_uuid, root_spec, kernel_dir, installer_name=INSTALLER_NAME):
     print("=== 5. Writing GRUB Hook (Non-Clobbering 40_custom Integration) ===")
     grub_d = Path("/etc/grub.d")
     grub_d.mkdir(parents=True, exist_ok=True)
@@ -597,82 +669,114 @@ insmod sleep
 insmod halt
 
 set target_boot_part=""
-search --fs-uuid --set=target_boot_part __BOOT_UUID__
+search --no-floppy --fs-uuid --set=target_boot_part __BOOT_UUID__
 
 if [ -n "$target_boot_part" ]; then
     if [ -f ($target_boot_part)/grub_hib_id ]; then
         source ($target_boot_part)/grub_hib_id
 
-        # Query live machine SMBIOS / DMI tables
+        # Query live machine SMBIOS / DMI tables using standard structure byte offsets
         set curr_sys_vendor=""
-        smbios --type 1 --get-string 1 --set=curr_sys_vendor
+        smbios --type 1 --get-string 4 --set=curr_sys_vendor
         set curr_product_name=""
-        smbios --type 1 --get-string 2 --set=curr_product_name
+        smbios --type 1 --get-string 5 --set=curr_product_name
         set curr_product_version=""
-        smbios --type 1 --get-string 3 --set=curr_product_version
+        smbios --type 1 --get-string 6 --set=curr_product_version
         set curr_bios_vendor=""
-        smbios --type 0 --get-string 1 --set=curr_bios_vendor
+        smbios --type 0 --get-string 4 --set=curr_bios_vendor
         set curr_bios_version=""
-        smbios --type 0 --get-string 2 --set=curr_bios_version
+        smbios --type 0 --get-string 5 --set=curr_bios_version
         set curr_board_vendor=""
-        smbios --type 2 --get-string 1 --set=curr_board_vendor
+        smbios --type 2 --get-string 4 --set=curr_board_vendor
         set curr_board_name=""
-        smbios --type 2 --get-string 2 --set=curr_board_name
+        smbios --type 2 --get-string 5 --set=curr_board_name
         set curr_cpu_model=""
-        smbios --type 4 --get-string 3 --set=curr_cpu_model
+        smbios --type 4 --get-string 16 --set=curr_cpu_model
         if [ -z "$curr_cpu_model" ]; then
             smbios --type 4 --get-string 5 --set=curr_cpu_model
         fi
         set current_grub_id="$curr_cpu_model"
 
-        # Check for hardware and DMI mismatches
+        # Check for hardware and DMI mismatches ONLY when fields resolved non-empty
         set grub_mismatch="0"
+        set sys_vendor_mismatch="0"
+        set product_name_mismatch="0"
+        set product_version_mismatch="0"
+        set bios_vendor_mismatch="0"
+        set bios_version_mismatch="0"
+        set board_vendor_mismatch="0"
+        set board_name_mismatch="0"
+        set grub_id_mismatch="0"
 
         if [ -n "$SAVED_SYS_VENDOR" ]; then
-            if [ "$curr_sys_vendor" != "$SAVED_SYS_VENDOR" ]; then
-                set grub_mismatch="1"
+            if [ -n "$curr_sys_vendor" ]; then
+                if [ "$curr_sys_vendor" != "$SAVED_SYS_VENDOR" ]; then
+                    set grub_mismatch="1"
+                    set sys_vendor_mismatch="1"
+                fi
             fi
         fi
 
         if [ -n "$SAVED_PRODUCT_NAME" ]; then
-            if [ "$curr_product_name" != "$SAVED_PRODUCT_NAME" ]; then
-                set grub_mismatch="1"
+            if [ -n "$curr_product_name" ]; then
+                if [ "$curr_product_name" != "$SAVED_PRODUCT_NAME" ]; then
+                    set grub_mismatch="1"
+                    set product_name_mismatch="1"
+                fi
             fi
         fi
 
         if [ -n "$SAVED_PRODUCT_VERSION" ]; then
-            if [ "$curr_product_version" != "$SAVED_PRODUCT_VERSION" ]; then
-                set grub_mismatch="1"
+            if [ -n "$curr_product_version" ]; then
+                if [ "$curr_product_version" != "$SAVED_PRODUCT_VERSION" ]; then
+                    set grub_mismatch="1"
+                    set product_version_mismatch="1"
+                fi
             fi
         fi
 
         if [ -n "$SAVED_BIOS_VENDOR" ]; then
-            if [ "$curr_bios_vendor" != "$SAVED_BIOS_VENDOR" ]; then
-                set grub_mismatch="1"
+            if [ -n "$curr_bios_vendor" ]; then
+                if [ "$curr_bios_vendor" != "$SAVED_BIOS_VENDOR" ]; then
+                    set grub_mismatch="1"
+                    set bios_vendor_mismatch="1"
+                fi
             fi
         fi
 
         if [ -n "$SAVED_BIOS_VERSION" ]; then
-            if [ "$curr_bios_version" != "$SAVED_BIOS_VERSION" ]; then
-                set grub_mismatch="1"
+            if [ -n "$curr_bios_version" ]; then
+                if [ "$curr_bios_version" != "$SAVED_BIOS_VERSION" ]; then
+                    set grub_mismatch="1"
+                    set bios_version_mismatch="1"
+                fi
             fi
         fi
 
         if [ -n "$SAVED_BOARD_VENDOR" ]; then
-            if [ "$curr_board_vendor" != "$SAVED_BOARD_VENDOR" ]; then
-                set grub_mismatch="1"
+            if [ -n "$curr_board_vendor" ]; then
+                if [ "$curr_board_vendor" != "$SAVED_BOARD_VENDOR" ]; then
+                    set grub_mismatch="1"
+                    set board_vendor_mismatch="1"
+                fi
             fi
         fi
 
         if [ -n "$SAVED_BOARD_NAME" ]; then
-            if [ "$curr_board_name" != "$SAVED_BOARD_NAME" ]; then
-                set grub_mismatch="1"
+            if [ -n "$curr_board_name" ]; then
+                if [ "$curr_board_name" != "$SAVED_BOARD_NAME" ]; then
+                    set grub_mismatch="1"
+                    set board_name_mismatch="1"
+                fi
             fi
         fi
 
         if [ -n "$SAVED_GRUB_ID" ]; then
-            if [ "$current_grub_id" != "$SAVED_GRUB_ID" ]; then
-                set grub_mismatch="1"
+            if [ -n "$current_grub_id" ]; then
+                if [ "$current_grub_id" != "$SAVED_GRUB_ID" ]; then
+                    set grub_mismatch="1"
+                    set grub_id_mismatch="1"
+                fi
             fi
         fi
 
@@ -684,24 +788,27 @@ if [ -n "$target_boot_part" ]; then
             echo "============================================================"
             echo "  [SAFEGUARD] HIBERNATION HARDWARE MISMATCH DETECTED!"
             echo "============================================================"
-            echo "Environment change detected since hibernation:"
-            if [ -n "$SAVED_SYS_VENDOR" ]; then
-                echo "  System Vendor:  '$SAVED_SYS_VENDOR' -> '$curr_sys_vendor'"
+            echo "Hardware changes detected since hibernation:"
+            if [ "$sys_vendor_mismatch" = "1" ]; then
+                echo "  System Vendor:   '$SAVED_SYS_VENDOR' -> '$curr_sys_vendor'"
             fi
-            if [ -n "$SAVED_PRODUCT_NAME" ]; then
-                echo "  Product Name:   '$SAVED_PRODUCT_NAME' -> '$curr_product_name'"
+            if [ "$product_name_mismatch" = "1" ]; then
+                echo "  Product Name:    '$SAVED_PRODUCT_NAME' -> '$curr_product_name'"
             fi
-            if [ -n "$SAVED_BIOS_VENDOR" ]; then
-                echo "  BIOS Vendor:    '$SAVED_BIOS_VENDOR' -> '$curr_bios_vendor'"
+            if [ "$product_version_mismatch" = "1" ]; then
+                echo "  Product Version: '$SAVED_PRODUCT_VERSION' -> '$curr_product_version'"
             fi
-            if [ -n "$SAVED_BIOS_VERSION" ]; then
-                echo "  BIOS Version:   '$SAVED_BIOS_VERSION' -> '$curr_bios_version'"
+            if [ "$bios_vendor_mismatch" = "1" ]; then
+                echo "  BIOS Vendor:     '$SAVED_BIOS_VENDOR' -> '$curr_bios_vendor'"
             fi
-            if [ -n "$SAVED_BOARD_NAME" ]; then
-                echo "  Board Name:     '$SAVED_BOARD_NAME' -> '$curr_board_name'"
+            if [ "$bios_version_mismatch" = "1" ]; then
+                echo "  BIOS Version:    '$SAVED_BIOS_VERSION' -> '$curr_bios_version'"
             fi
-            if [ -n "$SAVED_GRUB_ID" ]; then
-                echo "  Processor / ID: '$SAVED_GRUB_ID' -> '$current_grub_id'"
+            if [ "$board_name_mismatch" = "1" ]; then
+                echo "  Board Name:      '$SAVED_BOARD_NAME' -> '$curr_board_name'"
+            fi
+            if [ "$grub_id_mismatch" = "1" ]; then
+                echo "  Processor / ID:  '$SAVED_GRUB_ID' -> '$current_grub_id'"
             fi
             echo "============================================================"
             echo "Automatic countdown is DISABLED."
@@ -710,7 +817,9 @@ if [ -n "$target_boot_part" ]; then
             echo "  2. Discard Hibernation Image & Boot Cleanly"
             echo "  3. Force Resume Anyway (Danger: Hardware Mismatch)"
             echo "============================================================"
-            sleep 2
+            echo ""
+            echo "Press any key to proceed to the menu (or waiting 30 seconds)..."
+            sleep --interruptible 30
 
             # Dedicated Safeguard Menu Options in pure ASCII (Safe Power Off is Entry 1 and default)
             menuentry "[SAFEGUARD] 1. Power Off Machine (Preserve Hibernation Session - Default)" --id=safeguard_poweroff {
@@ -719,13 +828,24 @@ if [ -n "$target_boot_part" ]; then
             }
 
             menuentry "[SAFEGUARD] 2. Discard Hibernation Image & Boot Cleanly" --id=safeguard_clean {
-                set linux_resume_param=""
-                set noresume="1"
-                echo "Clean boot selected: resume parameters cleared."
+                echo "Loading kernel for clean boot (noresume)..."
+                search --no-floppy --fs-uuid --set=root __BOOT_UUID__
+                linux __KERNEL_DIR__/vmlinuz root=__ROOT_SPEC__ ro quiet noresume
+                initrd __KERNEL_DIR__/initrd.img
+                boot
             }
 
             menuentry "[SAFEGUARD] 3. Force Resume Anyway (Dangerous - May Panic)" --id=safeguard_force {
-                echo "Proceeding with resume on mismatched hardware..."
+                echo "Loading kernel for forced resume..."
+                search --no-floppy --fs-uuid --set=root __BOOT_UUID__
+                if [ -n "$SAVED_KERNEL_VERSION" ]; then
+                    linux __KERNEL_DIR__/vmlinuz-$SAVED_KERNEL_VERSION root=__ROOT_SPEC__ ro quiet
+                    initrd __KERNEL_DIR__/initrd.img-$SAVED_KERNEL_VERSION
+                else
+                    linux __KERNEL_DIR__/vmlinuz root=__ROOT_SPEC__ ro quiet
+                    initrd __KERNEL_DIR__/initrd.img
+                fi
+                boot
             }
 
             # Enforce preselected default to safe power off
@@ -743,6 +863,8 @@ __SENTINEL_END__"""
         template_block.replace("__SENTINEL_START__", sentinel_start)
         .replace("__SENTINEL_END__", sentinel_end)
         .replace("__BOOT_UUID__", boot_uuid)
+        .replace("__ROOT_SPEC__", root_spec)
+        .replace("__KERNEL_DIR__", kernel_dir)
     )
 
     standard_header = """#!/bin/sh
@@ -1245,12 +1367,23 @@ def install(installer_name=INSTALLER_NAME):
             pass
 
     cleanup_legacy_artifacts()
-    boot_dev, boot_uuid, has_grub, has_systemd_boot, esp_dir = gather_machine_layout()
+    (
+        boot_dev,
+        boot_uuid,
+        root_dev,
+        root_uuid,
+        root_spec,
+        kernel_dir,
+        has_grub,
+        has_systemd_boot,
+        esp_dir,
+    ) = gather_machine_layout()
     configure_initramfs_framework(installer_name)
     write_machine_id_helper(installer_name)
     write_systemd_sleep_hook(installer_name)
+    write_boot_cleanup_service(installer_name)
     if has_grub:
-        write_grub_hooks(boot_uuid, installer_name)
+        write_grub_hooks(boot_uuid, root_spec, kernel_dir, installer_name)
     write_initramfs_hook(boot_uuid, installer_name)
     compile_images(has_grub)
     print("=== SUCCESS ===")
@@ -1272,6 +1405,9 @@ def show_status(installer_name=INSTALLER_NAME):
 
     sleep_hook = Path("/lib/systemd/system-sleep/hibernation-hardware-tag")
     sleep_hook_ok = sleep_hook.is_file() and os.access(sleep_hook, os.X_OK)
+
+    cleanup_svc = Path("/lib/systemd/system/hibernation-safeguard-cleanup.service")
+    cleanup_svc_ok = cleanup_svc.is_file()
 
     init_hook = Path("/etc/initramfs-tools/scripts/local-top/hibernation_resume_check")
     init_hook_ok = init_hook.is_file() and os.access(init_hook, os.X_OK)
@@ -1306,6 +1442,9 @@ def show_status(installer_name=INSTALLER_NAME):
     )
     print(
         f"  - Systemd sleep hook (/lib/systemd/system-sleep/...)               : {badge(sleep_hook_ok)}"
+    )
+    print(
+        f"  - Boot cleanup service (hibernation-safeguard-cleanup.service)     : {badge(cleanup_svc_ok)}"
     )
     print(
         f"  - Initramfs check hook (/etc/initramfs-tools/scripts/local-top/..): {badge(init_hook_ok)}"
@@ -1453,6 +1592,7 @@ def show_status(installer_name=INSTALLER_NAME):
         [
             helper_ok,
             sleep_hook_ok,
+            cleanup_svc_ok,
             init_hook_ok,
             tool_hook_ok,
             modules_ok,
@@ -1464,6 +1604,7 @@ def show_status(installer_name=INSTALLER_NAME):
         [
             helper_ok,
             sleep_hook_ok,
+            cleanup_svc_ok,
             init_hook_ok,
             tool_hook_ok,
             modules_ok,
