@@ -20,6 +20,8 @@ Strict isolation of /boot and /boot/efi to eliminate post-resume filesystem corr
 Comprehensive DMI/SMBIOS (vendor/model/bios/board/cpu) cross-validation across GRUB and initramfs without generic field filtering.
 Seamless kernel rollback/override handling on systemd-boot and GRUB during hibernation resume with automatic restoration for future boots.
 Strict bootloader isolation ensuring systemd-boot never hijacks resumption if the current session booted via GRUB or other loaders.
+Robust physical MAC address discovery supporting Ethernet, Wi-Fi, and userspace-configured links with IEEE 802 universal/local bit validation.
+Automatic bundling of ethtool into initramfs for permanent EEPROM MAC querying.
 Interactive mismatch recovery menus:
   - GRUB: Pure ASCII menu with disabled countdown, safe Power Off default/preselected, Discard (clean boot), and Force Resume options.
   - Initramfs: Distinct non-password interactive prompt requiring fully typed words ('yes', 'no', 'force') to prevent accidental single-key passphrase triggers.
@@ -245,6 +247,26 @@ def configure_initramfs_framework(installer_name=INSTALLER_NAME):
         f"FIRMWARE=all\n"
     )
 
+    # Install initramfs hook to bundle ethtool binary and libraries into initramfs
+    hooks_d = Path("/etc/initramfs-tools/hooks")
+    hooks_d.mkdir(parents=True, exist_ok=True)
+    tool_hook = hooks_d / "hibernation_safeguard_tools"
+    tool_hook_content = f"""#!/bin/sh
+# Installed by {installer_name}
+# Bundles ethtool binary for permanent hardware MAC inspection into initramfs
+PREREQ=""
+prereqs() {{ echo "$PREREQ"; }}
+case $1 in prereqs) prereqs; exit 0;; esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+if command -v ethtool >/dev/null 2>&1; then
+    copy_exec $(command -v ethtool) /sbin
+fi
+"""
+    tool_hook.write_text(tool_hook_content)
+    tool_hook.chmod(0o755)
+
 
 def write_machine_id_helper(installer_name=INSTALLER_NAME):
     print("=== 3. Creating Hardware Hibernation Machine ID Helper ===")
@@ -333,9 +355,20 @@ for candidate_dir in /sys/class/net/w* /sys/class/net/e*; do
 
     [ ! -e "$candidate_dir/device" ] && continue
 
+    # Reject kernel-randomized addresses (type 1)
     if [ -f "$candidate_dir/addr_assign_type" ]; then
         assign_type=$(cat "$candidate_dir/addr_assign_type" 2>/dev/null | tr -d '\r\n ')
-        [ "$assign_type" != "0" ] && continue
+        [ "$assign_type" = "1" ] && continue
+    fi
+
+    # Query ethtool permanent hardware address if available
+    if command -v ethtool >/dev/null 2>&1; then
+        perm_val=$(ethtool -P "$iface_name" 2>/dev/null | awk '/Permanent address:/ {print $3}' | tr -d '\r\n ')
+        if is_permanent_hw_mac "$perm_val"; then
+            MAC_STR="$perm_val"
+            IFACE_STR="$iface_name"
+            break
+        fi
     fi
 
     if [ -f "$candidate_dir/address" ]; then
@@ -946,20 +979,32 @@ if [ -n "$SAVED_KERNEL" ] || [ -n "$SAVED_CPU" ] || [ -n "$SAVED_SYS_VENDOR" ] |
     fi
 
     if [ -n "$SAVED_MAC" ] && [ -n "$SAVED_MAC_IFACE" ]; then
-        if [ -f "/sys/class/net/$SAVED_MAC_IFACE/address" ]; then
-            curr_val=$(cat "/sys/class/net/$SAVED_MAC_IFACE/address" 2>/dev/null | tr -d '\r\n ')
+        curr_val=""
+        # Try ethtool first if present
+        if command -v ethtool >/dev/null 2>&1; then
+            perm_val=$(ethtool -P "$SAVED_MAC_IFACE" 2>/dev/null | awk '/Permanent address:/ {print $3}' | tr -d '\r\n ')
+            if is_permanent_hw_mac "$perm_val"; then
+                curr_val="$perm_val"
+            fi
+        fi
+
+        if [ -z "$curr_val" ] && [ -f "/sys/class/net/$SAVED_MAC_IFACE/address" ]; then
+            val=$(cat "/sys/class/net/$SAVED_MAC_IFACE/address" 2>/dev/null | tr -d '\r\n ')
             is_perm=true
             if [ -f "/sys/class/net/$SAVED_MAC_IFACE/addr_assign_type" ]; then
                 assign_type=$(cat "/sys/class/net/$SAVED_MAC_IFACE/addr_assign_type" 2>/dev/null | tr -d '\r\n ')
-                [ "$assign_type" != "0" ] && is_perm=false
+                [ "$assign_type" = "1" ] && is_perm=false
             fi
+            if [ "$is_perm" = true ] && is_permanent_hw_mac "$val"; then
+                curr_val="$val"
+            fi
+        fi
 
-            if [ "$is_perm" = true ] && is_permanent_hw_mac "$curr_val"; then
-                CURRENT_MAC="$curr_val"
-                if [ "$SAVED_MAC" != "$CURRENT_MAC" ]; then
-                    MAC_MISMATCH=true
-                    HAS_MISMATCH=true
-                fi
+        if [ -n "$curr_val" ]; then
+            CURRENT_MAC="$curr_val"
+            if [ "$SAVED_MAC" != "$CURRENT_MAC" ]; then
+                MAC_MISMATCH=true
+                HAS_MISMATCH=true
             fi
         fi
     fi
@@ -1190,6 +1235,15 @@ def install(installer_name=INSTALLER_NAME):
         "Note: Tested so far on Debian Forky/Sid (Debian 14 / unstable); should work on other x86-64 Debian flavors."
     )
     print()
+
+    # Ensure ethtool is available if apt-get is accessible
+    if not shutil.which("ethtool") and shutil.which("apt-get"):
+        print("Checking for ethtool package...")
+        try:
+            run_command(["apt-get", "install", "-y", "-qq", "ethtool"], check=False)
+        except Exception:
+            pass
+
     cleanup_legacy_artifacts()
     boot_dev, boot_uuid, has_grub, has_systemd_boot, esp_dir = gather_machine_layout()
     configure_initramfs_framework(installer_name)
@@ -1221,6 +1275,9 @@ def show_status(installer_name=INSTALLER_NAME):
 
     init_hook = Path("/etc/initramfs-tools/scripts/local-top/hibernation_resume_check")
     init_hook_ok = init_hook.is_file() and os.access(init_hook, os.X_OK)
+
+    tool_hook = Path("/etc/initramfs-tools/hooks/hibernation_safeguard_tools")
+    tool_hook_ok = tool_hook.is_file() and os.access(tool_hook, os.X_OK)
 
     modules_file = Path("/etc/initramfs-tools/modules")
     modules_ok = False
@@ -1254,6 +1311,9 @@ def show_status(installer_name=INSTALLER_NAME):
         f"  - Initramfs check hook (/etc/initramfs-tools/scripts/local-top/..): {badge(init_hook_ok)}"
     )
     print(
+        f"  - Initramfs tool hook (/etc/initramfs-tools/hooks/...)            : {badge(tool_hook_ok)}"
+    )
+    print(
         f"  - Initramfs modules config (sentinel block in /etc/.../modules)    : {cfg_badge(modules_ok)}"
     )
     print(
@@ -1283,13 +1343,14 @@ def show_status(installer_name=INSTALLER_NAME):
     board_name = read_dmi("board_name")
 
     if sys_vendor or product_name:
-        print(
-            f"  - System / Model  : {sys_vendor or 'Unknown'} {product_name or ''}".strip()
-        )
+        sys_str = f"{sys_vendor or ''} {product_name or ''}".strip() or "Unknown"
+        print(f"  - System / Model  : {sys_str}")
     if bios_vendor or bios_version:
-        print(f"  - BIOS Details    : {bios_vendor or ''} {bios_version or ''}".strip())
-    if board_name:
-        print(f"  - Baseboard       : {board_vendor or ''} {board_name}".strip())
+        bios_str = f"{bios_vendor or ''} {bios_version or ''}".strip()
+        print(f"  - BIOS Details    : {bios_str}")
+    if board_vendor or board_name:
+        board_str = f"{board_vendor or ''} {board_name or ''}".strip()
+        print(f"  - Baseboard       : {board_str}")
 
     cpu = "Unknown"
     cpuinfo = Path("/proc/cpuinfo")
@@ -1321,8 +1382,36 @@ def show_status(installer_name=INSTALLER_NAME):
                 continue
             addr_file = candidate / "address"
             assign_file = candidate / "addr_assign_type"
-            if assign_file.is_file() and assign_file.read_text().strip() != "0":
+            if assign_file.is_file() and assign_file.read_text().strip() == "1":
                 continue
+
+            perm_mac = None
+            if shutil.which("ethtool"):
+                try:
+                    res_eth = subprocess.run(
+                        ["ethtool", "-P", candidate.name],
+                        capture_output=True,
+                        text=True,
+                        timeout=1,
+                    )
+                    for line in res_eth.stdout.splitlines():
+                        if "Permanent address:" in line:
+                            pval = line.split("Permanent address:", 1)[1].strip()
+                            if (
+                                len(pval) == 17
+                                and pval[1].lower() in "048c"
+                                and pval != "00:00:00:00:00:00"
+                            ):
+                                perm_mac = pval
+                                break
+                except Exception:
+                    pass
+
+            if perm_mac:
+                mac = perm_mac
+                mac_iface = candidate.name
+                break
+
             if addr_file.is_file():
                 val = addr_file.read_text().strip()
                 if (
@@ -1333,6 +1422,7 @@ def show_status(installer_name=INSTALLER_NAME):
                     mac = val
                     mac_iface = candidate.name
                     break
+
     print(f"  - Permanent MAC   : {mac} (interface: {mac_iface})")
     print()
 
@@ -1360,10 +1450,26 @@ def show_status(installer_name=INSTALLER_NAME):
     print()
 
     all_ok = all(
-        [helper_ok, sleep_hook_ok, init_hook_ok, modules_ok, dropin_ok, grub_hook_ok]
+        [
+            helper_ok,
+            sleep_hook_ok,
+            init_hook_ok,
+            tool_hook_ok,
+            modules_ok,
+            dropin_ok,
+            grub_hook_ok,
+        ]
     )
     any_ok = any(
-        [helper_ok, sleep_hook_ok, init_hook_ok, modules_ok, dropin_ok, grub_hook_ok]
+        [
+            helper_ok,
+            sleep_hook_ok,
+            init_hook_ok,
+            tool_hook_ok,
+            modules_ok,
+            dropin_ok,
+            grub_hook_ok,
+        ]
     )
     if all_ok:
         print(
