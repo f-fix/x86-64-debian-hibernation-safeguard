@@ -20,16 +20,16 @@ Strict isolation of /boot and /boot/efi to eliminate post-resume filesystem corr
 Comprehensive DMI/SMBIOS (vendor/model/bios/board/cpu) cross-validation across GRUB and initramfs.
 Standard SMBIOS byte-offset retrieval in GRUB with automatic skip on unretrievable/empty fields.
 GRUB mismatch screen with 30-second interruptible reading pause and display of changed fields only.
-Functional GRUB menu entries preserving full default hardware kernel parameters with explicit boot commands.
+Functional GRUB menu entries preserving full default hardware kernel parameters and resume= targets with explicit boot commands.
 Automatic cleanup service guaranteeing deletion of leftover hibernation files on every normal (non-resume) boot.
 Seamless kernel rollback/override handling on systemd-boot and GRUB during hibernation resume with automatic restoration for future boots.
 Strict bootloader isolation ensuring systemd-boot never hijacks resumption if the current session booted via GRUB or other loaders.
 Robust physical MAC address discovery supporting Ethernet, Wi-Fi, and userspace-configured links with IEEE 802 universal/local bit validation.
-Dedicated compiled C micro-daemon for direct evdev/console keyboard capture in early initramfs.
+Dedicated compiled C micro-daemon for direct evdev, console, and tty keyboard capture in early initramfs with live Plymouth bootsplash message updates.
 Automatic bundling of ethtool and C resume prompt binary into initramfs.
 Interactive mismatch recovery menus:
   - GRUB: Pure ASCII menu with disabled countdown, safe Power Off default/preselected, Discard (clean boot), and Force Resume options.
-  - Initramfs: Distinct non-password interactive prompt requiring fully typed words ('yes', 'no', 'force') with live typing echo and evdev support.
+  - Initramfs: Distinct non-password interactive prompt requiring fully typed words ('yes', 'no', 'force') with live typing echo on both Plymouth and text consoles.
 """
 
 import os
@@ -58,13 +58,17 @@ SAFEGUARD_MODULES = [
     "cfg80211",
     "dm_mod",
     "evdev",
+    "atkbd",
     "i8042",
     "button",
+    "hid_generic",
+    "usbhid",
 ]
 
 C_PROMPT_SOURCE = r"""/*
  * hibernation-resume-prompt.c
- * Direct evdev & console interactive confirmation prompt for initramfs
+ * Universal Direct evdev, tty & console interactive prompt for initramfs
+ * Supports live Plymouth bootsplash message updates and text console
  * Installed by x86-64-debian-hibernation-safeguard.py
  */
 
@@ -75,30 +79,78 @@ C_PROMPT_SOURCE = r"""/*
 #include <poll.h>
 #include <signal.h>
 #include <string.h>
-#include <stdarg.h>
 #include <ctype.h>
 #include <glob.h>
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/reboot.h>
-#include <sys/ioctl.h>
 #include <linux/input.h>
 #include <termios.h>
 
-static int console_fd = -1;
+#define MAX_FDS 64
+
+static int out_fds[8];
+static int num_out_fds = 0;
+static int plymouth_active = 0;
+
+static void add_out_fd(int fd) {
+    if (fd < 0) return;
+    for (int i = 0; i < num_out_fds; i++) {
+        if (out_fds[i] == fd) return;
+    }
+    if (num_out_fds < 8) {
+        out_fds[num_out_fds++] = fd;
+    }
+}
 
 static void out_str(const char *s) {
-    if (console_fd >= 0) {
-        write(console_fd, s, strlen(s));
-    } else {
-        write(STDOUT_FILENO, s, strlen(s));
+    size_t len = strlen(s);
+    for (int i = 0; i < num_out_fds; i++) {
+        if (out_fds[i] >= 0) {
+            ssize_t w = write(out_fds[i], s, len);
+            (void)w;
+        }
     }
 }
 
 static void out_char(char c) {
     char b[2] = { c, '\0' };
     out_str(b);
+}
+
+static void set_nonblocking(int fd) {
+    if (fd < 0) return;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+}
+
+static int check_plymouth(void) {
+    if (access("/bin/plymouth", X_OK) == 0 || access("/usr/bin/plymouth", X_OK) == 0) {
+        if (system("plymouth --ping 2>/dev/null") == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void update_plymouth_msg(const char *msg) {
+    if (plymouth_active) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "plymouth message --text=\"%s\" 2>/dev/null", msg);
+        int r = system(cmd);
+        (void)r;
+    }
+}
+
+static void update_plymouth_prompt(const char *buf) {
+    if (plymouth_active) {
+        char line[128];
+        snprintf(line, sizeof(line), "Confirm action: > %s", buf);
+        update_plymouth_msg(line);
+    }
 }
 
 static char keycode_to_char(int code, int shift) {
@@ -129,82 +181,95 @@ static char keycode_to_char(int code, int shift) {
         case KEY_X: return shift ? 'X' : 'x';
         case KEY_Y: return shift ? 'Y' : 'y';
         case KEY_Z: return shift ? 'Z' : 'z';
+        case KEY_1: return '1';
+        case KEY_2: return '2';
+        case KEY_3: return '3';
+        case KEY_4: return '4';
+        case KEY_5: return '5';
+        case KEY_6: return '6';
+        case KEY_7: return '7';
+        case KEY_8: return '8';
+        case KEY_9: return '9';
+        case KEY_0: return '0';
         case KEY_SPACE: return ' ';
         default: return 0;
     }
 }
 
-static int scan_inputs(struct pollfd *fds, int max_fds) {
-    for (int i = 0; i < max_fds; i++) {
-        if (fds[i].fd >= 0 && fds[i].fd != STDIN_FILENO && fds[i].fd != console_fd) {
-            close(fds[i].fd);
-            fds[i].fd = -1;
+int main(int argc, char **argv) {
+    plymouth_active = check_plymouth();
+
+    int cfd = open("/dev/console", O_RDWR | O_NOCTTY);
+    if (cfd >= 0) add_out_fd(cfd);
+    int t0fd = open("/dev/tty0", O_RDWR | O_NOCTTY);
+    if (t0fd >= 0) add_out_fd(t0fd);
+    int t1fd = open("/dev/tty1", O_RDWR | O_NOCTTY);
+    if (t1fd >= 0) add_out_fd(t1fd);
+    add_out_fd(STDOUT_FILENO);
+
+    struct termios old_tio[8];
+    int tio_saved[8] = {0};
+    for (int i = 0; i < num_out_fds; i++) {
+        if (out_fds[i] >= 0 && isatty(out_fds[i])) {
+            if (tcgetattr(out_fds[i], &old_tio[i]) == 0) {
+                struct termios raw = old_tio[i];
+                raw.c_lflag &= (~ICANON & ~ECHO);
+                raw.c_cc[VMIN] = 0;
+                raw.c_cc[VTIME] = 0;
+                tcsetattr(out_fds[i], TCSANOW, &raw);
+                tio_saved[i] = 1;
+            }
         }
     }
+
+    if (!plymouth_active) {
+        out_str("\n");
+        out_str("==================================================\n");
+        out_str("*** NOTICE: THIS IS NOT A DISK PASSWORD PROMPT ***\n");
+        out_str("*** DO NOT TYPE YOUR DISK ENCRYPTION PASSWORD  ***\n");
+        out_str("==================================================\n");
+        out_str("Options (type full word + Enter):\n");
+        out_str("  * yes   - Discard hibernation snapshot and boot cleanly\n");
+        out_str("  * no    - Power off immediately (preserves session)\n");
+        out_str("  * force - Force resume attempt anyway (risk of panic)\n");
+        out_str("--------------------------------------------------\n");
+        out_str("Confirm action: > ");
+    } else {
+        update_plymouth_prompt("");
+    }
+
+    struct pollfd p_fds[MAX_FDS];
+    int is_evdev[MAX_FDS];
+    int num_p_fds = 0;
+
+    set_nonblocking(STDIN_FILENO);
+    p_fds[num_p_fds].fd = STDIN_FILENO;
+    p_fds[num_p_fds].events = POLLIN;
+    is_evdev[num_p_fds] = 0;
+    num_p_fds++;
+
+    for (int i = 0; i < num_out_fds; i++) {
+        if (out_fds[i] >= 0 && out_fds[i] != STDOUT_FILENO && out_fds[i] != STDIN_FILENO) {
+            set_nonblocking(out_fds[i]);
+            p_fds[num_p_fds].fd = out_fds[i];
+            p_fds[num_p_fds].events = POLLIN;
+            is_evdev[num_p_fds] = 0;
+            num_p_fds++;
+        }
+    }
+
     glob_t g;
-    int num_fds = 0;
     if (glob("/dev/input/event*", 0, NULL, &g) == 0) {
-        for (size_t i = 0; i < g.gl_pathc && num_fds < max_fds; i++) {
+        for (size_t i = 0; i < g.gl_pathc && num_p_fds < MAX_FDS - 1; i++) {
             int fd = open(g.gl_pathv[i], O_RDONLY | O_NONBLOCK);
             if (fd >= 0) {
-                fds[num_fds].fd = fd;
-                fds[num_fds].events = POLLIN;
-                num_fds++;
+                p_fds[num_p_fds].fd = fd;
+                p_fds[num_p_fds].events = POLLIN;
+                is_evdev[num_p_fds] = 1;
+                num_p_fds++;
             }
         }
         globfree(&g);
-    }
-    return num_fds;
-}
-
-int main(int argc, char **argv) {
-    console_fd = open("/dev/console", O_RDWR | O_NOCTTY);
-    if (console_fd < 0) {
-        console_fd = open("/dev/tty0", O_RDWR | O_NOCTTY);
-    }
-
-    struct termios old_tio, new_tio;
-    int tio_saved = 0;
-    if (console_fd >= 0 && tcgetattr(console_fd, &old_tio) == 0) {
-        new_tio = old_tio;
-        new_tio.c_lflag &= (~ICANON & ~ECHO);
-        new_tio.c_cc[VMIN] = 1;
-        new_tio.c_cc[VTIME] = 0;
-        tcsetattr(console_fd, TCSANOW, &new_tio);
-        tio_saved = 1;
-    }
-
-    out_str("\n");
-    out_str("==================================================\n");
-    out_str("*** NOTICE: THIS IS NOT A DISK PASSWORD PROMPT ***\n");
-    out_str("*** DO NOT TYPE YOUR DISK ENCRYPTION PASSWORD  ***\n");
-    out_str("==================================================\n");
-    out_str("Options (type full word + Enter):\n");
-    out_str("  * yes   - Discard hibernation snapshot and boot cleanly\n");
-    out_str("  * no    - Power off immediately (preserves session)\n");
-    out_str("  * force - Force resume attempt anyway (risk of panic)\n");
-    out_str("--------------------------------------------------\n");
-    out_str("Confirm action: > ");
-
-    struct pollfd fds[36];
-    for (int i = 0; i < 36; i++) fds[i].fd = -1;
-
-    int num_ev_fds = scan_inputs(fds, 32);
-
-    int stdin_idx = -1;
-    if (isatty(STDIN_FILENO)) {
-        stdin_idx = num_ev_fds;
-        fds[stdin_idx].fd = STDIN_FILENO;
-        fds[stdin_idx].events = POLLIN;
-        num_ev_fds++;
-    }
-
-    int console_idx = -1;
-    if (console_fd >= 0) {
-        console_idx = num_ev_fds;
-        fds[console_idx].fd = console_fd;
-        fds[console_idx].events = POLLIN;
-        num_ev_fds++;
     }
 
     char buffer[64];
@@ -214,83 +279,82 @@ int main(int argc, char **argv) {
     int shift_active = 0;
 
     while (1) {
-        int ret = poll(fds, num_ev_fds, 1000);
+        int ret = poll(p_fds, num_p_fds, 500);
         if (ret < 0) {
             if (errno == EINTR) continue;
             break;
         }
 
         if (ret == 0) {
-            // Periodic re-scan for newly plugged USB keyboards
-            int curr_extra = 0;
-            if (stdin_idx >= 0) curr_extra++;
-            if (console_idx >= 0) curr_extra++;
-            num_ev_fds = scan_inputs(fds, 32);
-            if (stdin_idx >= 0) {
-                fds[num_ev_fds].fd = STDIN_FILENO;
-                fds[num_ev_fds].events = POLLIN;
-                stdin_idx = num_ev_fds++;
-            }
-            if (console_idx >= 0) {
-                fds[num_ev_fds].fd = console_fd;
-                fds[num_ev_fds].events = POLLIN;
-                console_idx = num_ev_fds++;
-            }
             continue;
         }
 
-        for (int i = 0; i < num_ev_fds; i++) {
-            if (!(fds[i].revents & POLLIN)) continue;
+        for (int i = 0; i < num_p_fds; i++) {
+            if (!(p_fds[i].revents & POLLIN)) continue;
 
-            if (i == stdin_idx || i == console_idx) {
+            if (!is_evdev[i]) {
                 char ch;
-                while (read(fds[i].fd, &ch, 1) == 1) {
+                while (read(p_fds[i].fd, &ch, 1) == 1) {
                     if (ch == '\r' || ch == '\n') {
-                        // Check buffer
                         if (strcasecmp(buffer, "yes") == 0) {
                             out_str("\nSelected: Discard hibernation snapshot and boot cleanly.\n");
-                            if (tio_saved) tcsetattr(console_fd, TCSANOW, &old_tio);
+                            update_plymouth_msg("[CONFIRMED] Discarding hibernation image for clean boot.");
+                            if (plymouth_active) system("plymouth unpause-progress 2>/dev/null || true");
+                            for (int k = 0; k < num_out_fds; k++) {
+                                if (tio_saved[k]) tcsetattr(out_fds[k], TCSANOW, &old_tio[k]);
+                            }
                             return 0; // 0 = yes / discard
                         } else if (strcasecmp(buffer, "no") == 0) {
                             out_str("\nSelected: Power off machine.\n");
-                            if (tio_saved) tcsetattr(console_fd, TCSANOW, &old_tio);
+                            update_plymouth_msg("[CONFIRMED] Powering off machine...");
+                            for (int k = 0; k < num_out_fds; k++) {
+                                if (tio_saved[k]) tcsetattr(out_fds[k], TCSANOW, &old_tio[k]);
+                            }
                             return 1; // 1 = no / poweroff
                         } else if (strcasecmp(buffer, "force") == 0) {
                             out_str("\nSelected: Force resume anyway.\n");
-                            if (tio_saved) tcsetattr(console_fd, TCSANOW, &old_tio);
+                            update_plymouth_msg("[CONFIRMED] Forcing hibernation resume...");
+                            if (plymouth_active) system("plymouth unpause-progress 2>/dev/null || true");
+                            for (int k = 0; k < num_out_fds; k++) {
+                                if (tio_saved[k]) tcsetattr(out_fds[k], TCSANOW, &old_tio[k]);
+                            }
                             return 2; // 2 = force resume
                         } else {
                             out_str("\n[INVALID INPUT] Please type 'yes', 'no', or 'force' followed by Enter.\nConfirm action: > ");
+                            update_plymouth_msg("[INVALID INPUT] Type 'yes', 'no', or 'force' + Enter.");
                             buf_len = 0;
                             buffer[0] = '\0';
+                            update_plymouth_prompt(buffer);
                         }
                     } else if (ch == 127 || ch == '\b') {
                         if (buf_len > 0) {
                             buf_len--;
                             buffer[buf_len] = '\0';
                             out_str("\b \b");
+                            update_plymouth_prompt(buffer);
                         }
                     } else if (isprint(ch)) {
                         if (buf_len < (int)sizeof(buffer) - 1) {
                             buffer[buf_len++] = ch;
                             buffer[buf_len] = '\0';
                             out_char(ch);
+                            update_plymouth_prompt(buffer);
                         }
                     }
                 }
             } else {
-                // evdev input_event
                 struct input_event ev;
-                while (read(fds[i].fd, &ev, sizeof(ev)) == sizeof(ev)) {
+                while (read(p_fds[i].fd, &ev, sizeof(ev)) == sizeof(ev)) {
                     if (ev.type == EV_KEY) {
                         if (ev.code == KEY_LEFTSHIFT || ev.code == KEY_RIGHTSHIFT) {
                             shift_active = (ev.value != 0);
                             continue;
                         }
 
-                        if (ev.value == 1 || ev.value == 2) { // Key down or repeat
+                        if (ev.value == 1 || ev.value == 2) {
                             if (ev.code == KEY_POWER || ev.code == KEY_POWER2) {
                                 out_str("\n[POWER] Power button pressed. Powering off immediately...\n");
+                                update_plymouth_msg("[POWER] Power button pressed. Powering off...");
                                 sync();
                                 reboot(RB_POWER_OFF);
                                 exit(1);
@@ -299,26 +363,40 @@ int main(int argc, char **argv) {
                             if (ev.code == KEY_ENTER || ev.code == KEY_KPENTER) {
                                 if (strcasecmp(buffer, "yes") == 0) {
                                     out_str("\nSelected: Discard hibernation snapshot and boot cleanly.\n");
-                                    if (tio_saved) tcsetattr(console_fd, TCSANOW, &old_tio);
-                                    return 0; // 0 = discard
+                                    update_plymouth_msg("[CONFIRMED] Discarding hibernation image for clean boot.");
+                                    if (plymouth_active) system("plymouth unpause-progress 2>/dev/null || true");
+                                    for (int k = 0; k < num_out_fds; k++) {
+                                        if (tio_saved[k]) tcsetattr(out_fds[k], TCSANOW, &old_tio[k]);
+                                    }
+                                    return 0; // 0 = discard / clean boot
                                 } else if (strcasecmp(buffer, "no") == 0) {
                                     out_str("\nSelected: Power off machine.\n");
-                                    if (tio_saved) tcsetattr(console_fd, TCSANOW, &old_tio);
-                                    return 1; // 1 = poweroff
+                                    update_plymouth_msg("[CONFIRMED] Powering off machine...");
+                                    for (int k = 0; k < num_out_fds; k++) {
+                                        if (tio_saved[k]) tcsetattr(out_fds[k], TCSANOW, &old_tio[k]);
+                                    }
+                                    return 1; // 1 = power off
                                 } else if (strcasecmp(buffer, "force") == 0) {
                                     out_str("\nSelected: Force resume anyway.\n");
-                                    if (tio_saved) tcsetattr(console_fd, TCSANOW, &old_tio);
+                                    update_plymouth_msg("[CONFIRMED] Forcing hibernation resume...");
+                                    if (plymouth_active) system("plymouth unpause-progress 2>/dev/null || true");
+                                    for (int k = 0; k < num_out_fds; k++) {
+                                        if (tio_saved[k]) tcsetattr(out_fds[k], TCSANOW, &old_tio[k]);
+                                    }
                                     return 2; // 2 = force resume
                                 } else {
                                     out_str("\n[INVALID INPUT] Please type 'yes', 'no', or 'force' followed by Enter.\nConfirm action: > ");
+                                    update_plymouth_msg("[INVALID INPUT] Type 'yes', 'no', or 'force' + Enter.");
                                     buf_len = 0;
                                     buffer[0] = '\0';
+                                    update_plymouth_prompt(buffer);
                                 }
                             } else if (ev.code == KEY_BACKSPACE || ev.code == KEY_DELETE) {
                                 if (buf_len > 0) {
                                     buf_len--;
                                     buffer[buf_len] = '\0';
                                     out_str("\b \b");
+                                    update_plymouth_prompt(buffer);
                                 }
                             } else {
                                 char c = keycode_to_char(ev.code, shift_active);
@@ -327,6 +405,7 @@ int main(int argc, char **argv) {
                                         buffer[buf_len++] = c;
                                         buffer[buf_len] = '\0';
                                         out_char(c);
+                                        update_plymouth_prompt(buffer);
                                     }
                                 }
                             }
@@ -337,14 +416,16 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (tio_saved) tcsetattr(console_fd, TCSANOW, &old_tio);
+    for (int k = 0; k < num_out_fds; k++) {
+        if (tio_saved[k]) tcsetattr(out_fds[k], TCSANOW, &old_tio[k]);
+    }
     return 1;
 }
 """
 
 
 def get_default_kernel_cmdline():
-    params = []
+    raw_tokens = []
     default_grub = Path("/etc/default/grub")
     if default_grub.is_file():
         txt = default_grub.read_text()
@@ -355,9 +436,9 @@ def get_default_kernel_cmdline():
             r'^\s*GRUB_CMDLINE_LINUX_DEFAULT=["\'](.*?)["\']', txt, re.MULTILINE
         )
         if m_linux and m_linux.group(1).strip():
-            params.append(m_linux.group(1).strip())
+            raw_tokens.extend(m_linux.group(1).strip().split())
         if m_def and m_def.group(1).strip():
-            params.append(m_def.group(1).strip())
+            raw_tokens.extend(m_def.group(1).strip().split())
 
     grub_d = Path("/etc/default/grub.d")
     if grub_d.is_dir():
@@ -370,14 +451,13 @@ def get_default_kernel_cmdline():
                 r'^\s*GRUB_CMDLINE_LINUX_DEFAULT=["\'](.*?)["\']', txt, re.MULTILINE
             )
             if m_linux and m_linux.group(1).strip():
-                params.append(m_linux.group(1).strip())
+                raw_tokens.extend(m_linux.group(1).strip().split())
             if m_def and m_def.group(1).strip():
-                params.append(m_def.group(1).strip())
+                raw_tokens.extend(m_def.group(1).strip().split())
 
     cmdline_file = Path("/proc/cmdline")
     if cmdline_file.is_file():
         cmd_tokens = cmdline_file.read_text().strip().split()
-        live_tokens = []
         for token in cmd_tokens:
             if (
                 token.startswith("BOOT_IMAGE=")
@@ -386,25 +466,89 @@ def get_default_kernel_cmdline():
                 or token.startswith("grub_id=")
             ):
                 continue
-            if token in ["ro", "rw", "noresume", "splash"]:
+            if token in ["ro", "rw", "noresume"]:
                 continue
-            live_tokens.append(token)
-        if not params:
-            params = live_tokens
-        else:
-            existing = " ".join(params).split()
-            for lt in live_tokens:
-                if lt not in existing:
-                    params.append(lt)
+            raw_tokens.append(token)
 
+    seen = set()
     cleaned_tokens = []
-    for t in " ".join(params).split():
+    for t in raw_tokens:
         if t.startswith("resume=") or t == "noresume":
             continue
-        cleaned_tokens.append(t)
+        if t not in seen:
+            seen.add(t)
+            cleaned_tokens.append(t)
 
     result = " ".join(cleaned_tokens).strip()
     return result if result else "quiet"
+
+
+def get_resume_param():
+    resume_target = ""
+    resume_offset = ""
+
+    # 1. Check /proc/cmdline
+    cmdline_file = Path("/proc/cmdline")
+    if cmdline_file.is_file():
+        for token in cmdline_file.read_text().strip().split():
+            if token.startswith("resume="):
+                resume_target = token
+            elif token.startswith("resume_offset="):
+                resume_offset = token
+
+    # 2. Check /etc/initramfs-tools/conf.d/resume
+    if not resume_target:
+        conf_resume = Path("/etc/initramfs-tools/conf.d/resume")
+        if conf_resume.is_file():
+            txt = conf_resume.read_text()
+            m = re.search(r'^\s*RESUME=["\']?([^"\']+)["\']?', txt, re.MULTILINE)
+            if m and m.group(1).strip() and m.group(1).strip().lower() != "none":
+                val = m.group(1).strip()
+                resume_target = f"resume={val}"
+
+    # 3. Check /etc/default/grub & /etc/default/grub.d/*.cfg
+    if not resume_target:
+        for grub_cfg in [Path("/etc/default/grub")] + list(
+            Path("/etc/default/grub.d").glob("*.cfg")
+        ):
+            if grub_cfg.is_file():
+                txt = grub_cfg.read_text()
+                for line in txt.splitlines():
+                    if "GRUB_CMDLINE_LINUX" in line:
+                        for token in line.split():
+                            if token.startswith("resume="):
+                                resume_target = token.strip("\"'")
+                            elif token.startswith("resume_offset="):
+                                resume_offset = token.strip("\"'")
+
+    # 4. Check /proc/swaps
+    if not resume_target:
+        swaps_file = Path("/proc/swaps")
+        if swaps_file.is_file():
+            lines = swaps_file.read_text().splitlines()
+            for line in lines[1:]:
+                parts = line.split()
+                if parts and parts[0].startswith("/dev/"):
+                    swap_dev = parts[0]
+                    res = subprocess.run(
+                        ["blkid", "-s", "UUID", "-o", "value", swap_dev],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    s_uuid = res.stdout.strip()
+                    if s_uuid:
+                        resume_target = f"resume=UUID={s_uuid}"
+                    else:
+                        resume_target = f"resume={swap_dev}"
+                    break
+
+    parts = []
+    if resume_target:
+        parts.append(resume_target)
+    if resume_offset:
+        parts.append(resume_offset)
+    return " ".join(parts).strip()
 
 
 def run_command(cmd, check=True, capture_output=False, text=True):
@@ -556,6 +700,7 @@ def gather_machine_layout():
     root_spec = f"UUID={root_uuid}" if root_uuid else root_dev
 
     default_cmdline = get_default_kernel_cmdline()
+    resume_param = get_resume_param()
 
     has_grub = Path("/etc/grub.d").is_dir() and shutil.which("update-grub") is not None
 
@@ -572,6 +717,7 @@ def gather_machine_layout():
     )
     print(f"Resolved / (root) partition at {root_dev} (root_spec: {root_spec})")
     print(f"Hardware Kernel Cmdline Parameters: '{default_cmdline}'")
+    print(f"Resolved Resume Parameter: '{resume_param or 'none'}'")
     print(f"Detection Results -> GRUB: {has_grub} | systemd-boot: {has_systemd_boot}")
     return (
         boot_dev,
@@ -581,6 +727,7 @@ def gather_machine_layout():
         root_spec,
         kernel_dir,
         default_cmdline,
+        resume_param,
         has_grub,
         has_systemd_boot,
         esp_dir,
@@ -1024,7 +1171,12 @@ WantedBy=basic.target
 
 
 def write_grub_hooks(
-    boot_uuid, root_spec, kernel_dir, default_cmdline, installer_name=INSTALLER_NAME
+    boot_uuid,
+    root_spec,
+    kernel_dir,
+    default_cmdline,
+    resume_param,
+    installer_name=INSTALLER_NAME,
 ):
     print("=== 5. Writing GRUB Hook (Non-Clobbering 40_custom Integration) ===")
     grub_d = Path("/etc/grub.d")
@@ -1221,10 +1373,10 @@ if [ -n "$target_boot_part" ]; then
                 echo "Loading kernel for forced resume..."
                 search --no-floppy --fs-uuid --set=root __BOOT_UUID__
                 if [ -n "$SAVED_KERNEL_VERSION" ]; then
-                    linux __KERNEL_DIR__/vmlinuz-$SAVED_KERNEL_VERSION root=__ROOT_SPEC__ ro __DEFAULT_CMDLINE__
+                    linux __KERNEL_DIR__/vmlinuz-$SAVED_KERNEL_VERSION root=__ROOT_SPEC__ ro __DEFAULT_CMDLINE__ __RESUME_PARAM__
                     initrd __KERNEL_DIR__/initrd.img-$SAVED_KERNEL_VERSION
                 else
-                    linux __KERNEL_DIR__/vmlinuz root=__ROOT_SPEC__ ro __DEFAULT_CMDLINE__
+                    linux __KERNEL_DIR__/vmlinuz root=__ROOT_SPEC__ ro __DEFAULT_CMDLINE__ __RESUME_PARAM__
                     initrd __KERNEL_DIR__/initrd.img
                 fi
                 boot
@@ -1248,6 +1400,7 @@ __SENTINEL_END__"""
         .replace("__ROOT_SPEC__", root_spec)
         .replace("__KERNEL_DIR__", kernel_dir)
         .replace("__DEFAULT_CMDLINE__", default_cmdline)
+        .replace("__RESUME_PARAM__", resume_param)
     )
 
     standard_header = """#!/bin/sh
@@ -1485,7 +1638,6 @@ if [ -n "$SAVED_KERNEL" ] || [ -n "$SAVED_CPU" ] || [ -n "$SAVED_SYS_VENDOR" ] |
 
     if [ -n "$SAVED_MAC" ] && [ -n "$SAVED_MAC_IFACE" ]; then
         curr_val=""
-        # Try ethtool first if present
         if command -v ethtool >/dev/null 2>&1; then
             perm_val=$(ethtool -P "$SAVED_MAC_IFACE" 2>/dev/null | awk '/Permanent address:/ {print $3}' | tr -d '\r\n ')
             if is_permanent_hw_mac "$perm_val"; then
@@ -1538,9 +1690,7 @@ if [ "$HAS_MISMATCH" = true ]; then
     printf "%b" "$DETAILS"
     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
 
-    user_input=""
-
-    # Interactive prompt via Plymouth if active
+    # If Plymouth is active, display the warning and options list directly on Plymouth splash
     if [ -x /bin/plymouth ] && plymouth --ping 2>/dev/null; then
         plymouth pause-progress 2>/dev/null || true
         plymouth message --text="=================================================="
@@ -1553,35 +1703,26 @@ if [ "$HAS_MISMATCH" = true ]; then
         else
             plymouth message --text="Hardware / DMI environment change detected since hibernation."
         fi
-        plymouth message --text="Type full word: 'yes' (clean boot) | 'no' (power off) | 'force' (resume anyway)"
+        plymouth message --text="Options (type full word + Enter):"
+        plymouth message --text="  * yes   - Discard hibernation snapshot and boot cleanly"
+        plymouth message --text="  * no    - Power off immediately (preserves session)"
+        plymouth message --text="  * force - Force resume attempt anyway (risk of panic)"
         plymouth message --text="--------------------------------------------------"
-
-        while true; do
-            ans=$(plymouth ask-question --prompt="Type 'yes', 'no', or 'force' + Enter: " 2>/dev/null)
-            clean_ans=$(echo "$ans" | tr -d '\r\n ' | tr 'A-Z' 'a-z')
-            case "$clean_ans" in
-                yes)
-                    user_input="yes"
-                    break
-                    ;;
-                no)
-                    user_input="no"
-                    break
-                    ;;
-                force)
-                    user_input="force"
-                    break
-                    ;;
-                *)
-                    plymouth message --text="[INVALID] Single letters/passwords rejected. Type full word 'yes', 'no', or 'force'."
-                    ;;
-            esac
-        done
-        plymouth unpause-progress 2>/dev/null || true
+        plymouth message --text="Confirm action: > "
     fi
 
-    # Interactive prompt via compiled C evdev/console micro-daemon
-    if [ -z "$user_input" ] && [ -x /bin/hibernation-resume-prompt ]; then
+    # Ensure input kernel drivers are loaded and settled
+    modprobe evdev 2>/dev/null || true
+    modprobe atkbd 2>/dev/null || true
+    modprobe i8042 2>/dev/null || true
+    modprobe hid_generic 2>/dev/null || true
+    modprobe usbhid 2>/dev/null || true
+    command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
+
+    user_input=""
+
+    # Interactive prompt via compiled C evdev/console micro-daemon (updates Plymouth line dynamically)
+    if [ -x /bin/hibernation-resume-prompt ]; then
         /bin/hibernation-resume-prompt
         prompt_rc=$?
         case "$prompt_rc" in
@@ -1592,7 +1733,7 @@ if [ "$HAS_MISMATCH" = true ]; then
         esac
     fi
 
-    # Interactive prompt on text console fallback (if C daemon was not available)
+    # Text console fallback
     if [ -z "$user_input" ]; then
         echo "" > /dev/console 2>/dev/null || echo ""
         echo "==================================================" > /dev/console 2>/dev/null || echo "=================================================="
@@ -1770,6 +1911,7 @@ def install(installer_name=INSTALLER_NAME):
         root_spec,
         kernel_dir,
         default_cmdline,
+        resume_param,
         has_grub,
         has_systemd_boot,
         esp_dir,
@@ -1781,7 +1923,12 @@ def install(installer_name=INSTALLER_NAME):
     write_boot_cleanup_service(installer_name)
     if has_grub:
         write_grub_hooks(
-            boot_uuid, root_spec, kernel_dir, default_cmdline, installer_name
+            boot_uuid,
+            root_spec,
+            kernel_dir,
+            default_cmdline,
+            resume_param,
+            installer_name,
         )
     write_initramfs_hook(boot_uuid, installer_name)
     compile_images(has_grub)
