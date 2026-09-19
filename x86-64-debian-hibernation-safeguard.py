@@ -16,18 +16,21 @@ Full support for plain partitions, LUKS, LVM, and LUKS+LVM swap configurations.
 Non-clobbering configuration integration with sentinel markers.
 Automatic cleanup of legacy artifacts and past guard comments from previous iterations.
 Automatic privilege self-elevation (sudo/doas/pkexec).
-Strict isolation of /boot and /boot/efi to eliminate post-resume filesystem corruption.
+Strict read-only isolation of /boot in GRUB and initramfs (no rw mounting or writing in early boot).
+Clean userspace-only management of /boot target files without pre-sleep unmounts or post-sleep remounts.
+Inter-stage communication via /run tmpfs and kernel boot parameters.
 Comprehensive DMI/SMBIOS (vendor/model/bios/board/cpu) cross-validation across GRUB and initramfs.
 Standard SMBIOS byte-offset retrieval in GRUB with automatic skip on unretrievable/empty fields.
 GRUB mismatch screen with 30-second interruptible reading pause and display of changed fields only.
 Functional GRUB menu entries preserving full default hardware kernel parameters and resume= targets with explicit boot commands.
-Guaranteed early initramfs deletion of hibernation targets upon resume or discard before memory restoration.
-Multi-layer fallback cleanup service and post-sleep hooks guaranteeing deletion of leftover hibernation files.
+Automatic handling of read-only /boot and /boot/efi filesystems in userspace (remount rw for updates/cleanup with ro restoration).
+Userspace cleanup service and post-sleep hooks guaranteeing deletion of leftover hibernation files.
 Seamless kernel rollback/override handling on systemd-boot and GRUB during hibernation resume with automatic restoration for future boots.
 Strict bootloader isolation ensuring systemd-boot never hijacks resumption if the current session booted via GRUB or other loaders.
 Robust physical MAC address discovery supporting Ethernet, Wi-Fi, and userspace-configured links with IEEE 802 universal/local bit validation.
 Dedicated compiled C micro-daemon for direct evdev, console, and tty keyboard capture in early initramfs with live Plymouth bootsplash message updates.
 Automatic bundling of ethtool and C resume prompt binary into initramfs.
+Integrated README.md documentation paged via python's standard help pager (pydoc.pager).
 Interactive mismatch recovery menus:
   - GRUB: Pure ASCII menu with disabled countdown, safe Power Off default/preselected, Discard (clean boot), and Force Resume options.
   - Initramfs: Distinct non-password interactive prompt requiring fully typed words ('yes', 'no', 'force') with live typing echo on both Plymouth and text consoles.
@@ -37,6 +40,7 @@ import os
 import sys
 import re
 import shutil
+import pydoc
 import argparse
 import subprocess
 from pathlib import Path
@@ -65,6 +69,109 @@ SAFEGUARD_MODULES = [
     "hid_generic",
     "usbhid",
 ]
+
+README_DOC = r"""# x86-64-debian-hibernation-safeguard
+
+> Provide a little added safety around hibernate/resume on Debian running on x86-64 (supports some USB key portable install scenarios).
+
+Repository: [https://github.com/f-fix/x86-64-debian-hibernation-safeguard](https://github.com/f-fix/x86-64-debian-hibernation-safeguard)
+
+---
+
+## Overview
+
+Hibernating Linux writes the complete active memory state and kernel registers to swap storage. When using portable installations (e.g., Debian installed on an external USB SSD, thumb drive, or external NVMe enclosure) or moving drives between different machines, resuming on mismatched physical hardware results in driver hangs, memory map corruption, and kernel panics.
+
+`x86-64-debian-hibernation-safeguard` provides an automated **dual-stage hardware verification and isolation framework**:
+1. **Early Bootloader Validation (GRUB / systemd-boot):** Compares the machine's SMBIOS DMI information (vendor, model, BIOS version, baseboard, and processor) against the saved hibernation record before the kernel boots. Disables automatic timer countdowns, displays changed hardware attributes, and presents safe recovery options (Safe Power Off preselected, Clean Boot, and Force Resume).
+2. **Early Initramfs Validation:** Mounts `/boot` strictly read-only for a few milliseconds, immediately unmounts it, and validates Kernel version, DMI parameters, CPU model, numeric RAM capacity (with dynamic tolerance for stolen memory), and permanent hardware MAC addresses.
+3. **Safe Interactive Confirmation (Anti-Passphrase Leak):** Uses a dedicated non-password interactive filter loop with a compiled C evdev listener supporting both Plymouth splash screens (live in-place prompt line updates) and text consoles. Requires full words (`yes`, `no`, `force`) with **zero plaintext echoing** of passwords typed in error.
+4. **Resilient Discard (LUKS, LVM, and Plain Swap):** Selecting discard neutralizes resume binaries, zeroes `/sys/power/resume`, and sanitizes swap suspend signatures (`S1SUSPEND`/`S2SUSPEND` -> `SWAPSPACE2`) on plain partitions and inside LUKS/LVM volumes once unlocked.
+5. **Strict Early Read-Only Isolation:** Never writes to or mounts `/boot` rw in early boot. Communicates state transitions via `/run` tmpfs, allowing userspace services to manage all target files safely.
+
+---
+
+## Compatibility & Tested Platforms
+
+* **Tested Platform:** **Debian Forky/Sid (Debian 14 / unstable)** on `x86_64`.
+* **Other Flavors:** While architected using standard Linux kernel, procfs, sysfs, and `initramfs-tools` primitives that should work across other Debian versions and derivatives on `x86_64`, it is **currently only tested on Debian Forky/Sid**.
+* **Bootloaders:** GRUB 2 and/or `systemd-boot` (`bootctl`).
+* **Storage Configurations:** Plain swap partitions, swap on LUKS, swap on LVM, or swap on LUKS+LVM.
+
+---
+
+## Usage
+
+### 1. Check Installation Status (`--status`)
+To inspect your current system hardware identity and check which safeguard components and hooks are installed without making any modifications:
+
+```bash
+python3 x86-64-debian-hibernation-safeguard.py --status
+```
+
+### 2. Deploy the Safeguard (`--install`)
+To install the hooks, compile the C evdev prompt binary, configure bootloader integration, and update initramfs/boot images:
+
+```bash
+sudo python3 x86-64-debian-hibernation-safeguard.py --install
+```
+
+*(Note: If executed without root, the script automatically attempts privilege self-elevation via `sudo`, `doas`, or `pkexec`).*
+
+### 3. Display Documentation / Help (`--help` or `-h`)
+To display this full manual using the standard Python help pager:
+
+```bash
+python3 x86-64-debian-hibernation-safeguard.py --help
+```
+
+---
+
+## Architecture & Installed Files
+
+All installed scripts, configuration drop-ins, and guard blocks are traceable back to `x86-64-debian-hibernation-safeguard.py`:
+
+* **`/usr/local/bin/hibernation-machine-id`**: Helper that discovers permanent hardware identity (DMI strings, CPU, MemTotal, physical MAC), saves targets on hibernate, and clears them on resume. Includes a `--help` option identifying `x86-64-debian-hibernation-safeguard.py`.
+* **`/lib/systemd/system-sleep/hibernation-hardware-tag`**: Systemd sleep hook that saves target parameters prior to hibernation and cleans them up upon restore.
+* **`/lib/systemd/system/hibernation-safeguard-cleanup.service`**: Oneshot systemd service running at `basic.target` on every cold boot and clean startup to guarantee stale target records are cleared.
+* **`/usr/local/bin/hibernation-resume-prompt`**: Compiled native C micro-daemon for direct evdev, tty, and console input handling with live Plymouth bootsplash message line updates.
+* **`/etc/initramfs-tools/scripts/local-top/hibernation_resume_check`**: Early initramfs hook that mounts `/boot` strictly read-only, checks hardware parameters, and executes the interactive prompt if a mismatch is detected.
+* **`/etc/initramfs-tools/modules`**: Bounded by sentinel comments:
+  ```text
+  ### BEGIN HIBERNATION SAFEGUARD MODULES (installed by x86-64-debian-hibernation-safeguard.py) ###
+  ...
+  ### END HIBERNATION SAFEGUARD MODULES (installed by x86-64-debian-hibernation-safeguard.py) ###
+  ```
+* **`/etc/grub.d/40_custom`**: Bounded by sentinel comments:
+  ```text
+  ### BEGIN HIBERNATION HARDWARE SAFEGUARD (installed by x86-64-debian-hibernation-safeguard.py) ###
+  ...
+  ### END HIBERNATION HARDWARE SAFEGUARD (installed by x86-64-debian-hibernation-safeguard.py) ###
+  ```
+* **`/etc/initramfs-tools/conf.d/zz-hibernation-safeguard.conf`**: Drop-in configuration ensuring all necessary firmware is bundled into the initramfs.
+
+---
+
+## Troubleshooting Hibernation Hangs
+
+If your machine fails to complete hibernation (e.g. screen turns black, system freezes with cooling fans spinning at 100%), isolate the failing subsystem using the kernel power management testing interface:
+
+```bash
+# Test driver suspend/resume without powering down
+sudo bash -c 'echo devices > /sys/power/pm_test'
+sudo systemctl hibernate
+
+# Reset test mode back to normal
+sudo bash -c 'echo none > /sys/power/pm_test'
+```
+
+If the hang occurs during final power-down, `x86-64-debian-hibernation-safeguard.py` automatically configures `/sys/power/disk` to `shutdown` rather than `platform`, bypassing problematic BIOS ACPI S4 sleep routines.
+
+---
+
+## 🤖 Note on the code and the tools used to write it
+Parts of this code were written (including some initial ones that began in other, separate projects) with assistance from LLM-integrated coding tools. If you don't like it, feel free to use other software or rewrite parts you dislike. PRs are welcome!
+"""
 
 C_PROMPT_SOURCE = r"""/*
  * hibernation-resume-prompt.c
@@ -425,6 +532,19 @@ int main(int argc, char **argv) {
 """
 
 
+def ensure_boot_rw():
+    for mount_target in ["/boot", "/boot/efi", "/efi"]:
+        if Path(mount_target).is_mount() or Path(mount_target).is_dir():
+            try:
+                subprocess.run(
+                    ["mount", "-o", "remount,rw", mount_target],
+                    check=False,
+                    capture_output=True,
+                )
+            except Exception:
+                pass
+
+
 def get_default_kernel_cmdline():
     raw_tokens = []
     default_grub = Path("/etc/default/grub")
@@ -599,6 +719,7 @@ def cleanup_legacy_artifacts():
     print(
         "=== Cleaning Up Artifacts and Legacy Guard Sections From Previous Iterations ==="
     )
+    ensure_boot_rw()
 
     stale_paths = [
         Path("/etc/grub.d/08_hibernation_safeguard"),
@@ -612,7 +733,7 @@ def cleanup_legacy_artifacts():
         Path("/boot/loader/gpd_sdboot_hib_id"),
         Path("/boot/loader/sdboot_hib_id"),
         Path("/run/gpd/initramfs_id"),
-        Path("/run/hibernation-safeguard/initramfs_id"),
+        Path("/run/hibernation-safeguard"),
         Path("/tmp/gpd_ply_key"),
         Path("/tmp/hib_ply_key"),
         Path("/root/deploy_adaptive_protection.py"),
@@ -628,12 +749,24 @@ def cleanup_legacy_artifacts():
         stale_paths.append(gpath)
 
     for p in set(stale_paths):
-        if p.exists() and p.is_file():
-            try:
-                p.unlink()
-                print(f"Removed legacy/stale file: {p}")
-            except OSError as e:
-                sys.stderr.write(f"Warning: could not remove {p}: {e}\n")
+        if p.exists():
+            if p.is_file() or p.is_symlink():
+                try:
+                    p.unlink()
+                    print(f"Removed legacy/stale file: {p}")
+                except OSError:
+                    ensure_boot_rw()
+                    try:
+                        p.unlink()
+                        print(f"Removed legacy/stale file: {p}")
+                    except OSError as e2:
+                        sys.stderr.write(f"Warning: could not remove {p}: {e2}\n")
+            elif p.is_dir():
+                try:
+                    shutil.rmtree(p)
+                    print(f"Removed legacy directory: {p}")
+                except OSError as e:
+                    sys.stderr.write(f"Warning: could not remove directory {p}: {e}\n")
 
     legacy_run_dir = Path("/run/gpd")
     if legacy_run_dir.exists() and legacy_run_dir.is_dir():
@@ -969,6 +1102,14 @@ SAVED_KERNEL="$CURRENT_KERNEL"
 EOF_RUN
 
 if [ "$1" = "save-targets" ]; then
+    _was_ro=0
+    if mountpoint -q /boot 2>/dev/null; then
+        if grep -qE '[[:space:]]/boot[[:space:]]+[^ ]+[[:space:]]+([^ ]*,)?ro[, ]' /proc/mounts 2>/dev/null; then
+            _was_ro=1
+        fi
+        mount -o remount,rw /boot 2>/dev/null || true
+    fi
+
     cat << EOF_INIT > /boot/initramfs_hib_id
 # Generated for hibernation by __INSTALLER_NAME__
 SAVED_SYS_VENDOR="$SYS_VENDOR"
@@ -1012,6 +1153,10 @@ SAVED_GRUB_ID="$CURRENT_GRUB_ID"
 SAVED_KERNEL_VERSION="$CURRENT_KERNEL"
 EOF_GRUB
 
+    if [ "$_was_ro" = "1" ] && mountpoint -q /boot 2>/dev/null; then
+        mount -o remount,ro /boot 2>/dev/null || true
+    fi
+
     # Only configure systemd-boot overrides IF the current session was actually booted by systemd-boot.
     # If the system was booted via GRUB or another loader, leave systemd-boot untouched so it never hijacks bootloader priority.
     if was_booted_by_systemd_boot; then
@@ -1027,7 +1172,16 @@ EOF_GRUB
 fi
 
 if [ "$1" = "clear-targets" ]; then
+    _was_ro=0
+    if mountpoint -q /boot 2>/dev/null; then
+        if grep -qE '[[:space:]]/boot[[:space:]]+[^ ]+[[:space:]]+([^ ]*,)?ro[, ]' /proc/mounts 2>/dev/null; then
+            _was_ro=1
+        fi
+        mount -o remount,rw /boot 2>/dev/null || true
+    fi
+
     rm -f /boot/grub_hib_id /boot/initramfs_hib_id /boot/loader/sdboot_hib_id /boot/loader/gpd_sdboot_hib_id 2>/dev/null
+    rm -rf /run/hibernation-safeguard 2>/dev/null
 
     # If /boot is a separate partition, check if target partition holds uncleaned files
     _boot_uuid="__BOOT_UUID__"
@@ -1044,6 +1198,10 @@ if [ "$1" = "clear-targets" ]; then
                 rmdir "$_tmp_c" 2>/dev/null || true
             fi
         fi
+    fi
+
+    if [ "$_was_ro" = "1" ] && mountpoint -q /boot 2>/dev/null; then
+        mount -o remount,ro /boot 2>/dev/null || true
     fi
 
     if was_booted_by_systemd_boot || [ -f /boot/loader/sdboot_hib_id ]; then
@@ -1073,14 +1231,14 @@ fi
 
 
 def write_systemd_sleep_hook(installer_name=INSTALLER_NAME):
-    print("=== 4. Setting up Systemd Sleep Hooks (Clean /boot Unmount & Remount) ===")
+    print(
+        "=== 4. Setting up Systemd Sleep Hooks (Clean Userspace Target Management) ==="
+    )
     hook_path = Path("/lib/systemd/system-sleep/hibernation-hardware-tag")
     hook_path.parent.mkdir(parents=True, exist_ok=True)
     content_template = r"""#!/bin/bash
 # Installed by __INSTALLER_NAME__
 # Universal Pre- and Post-Sleep Hook for Hardware Hibernation Safeguard
-# Protects /boot and /boot/efi from corruption by unmounting before hibernate snapshot
-# and remounting after session restore.
 # Note: Tested so far on Debian Forky/Sid (Debian 14 / unstable)
 
 if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
@@ -1094,59 +1252,21 @@ fi
 if [ "$1" = "pre" ] && [ "$2" = "hibernate" ]; then
     echo "Hibernation Safeguard (__INSTALLER_NAME__): Preparing system state for hibernation..."
 
-    # 1. Save hardware targets to /boot while still mounted
+    # 1. Save hardware targets to /boot
     /usr/local/bin/hibernation-machine-id save-targets
 
     # 2. Flush dirty filesystem buffers to disk
     sync
 
-    # 3. Unmount /boot/efi and /boot if they are separate mountpoints.
-    # When unmounted before the kernel takes the hibernation snapshot, the memory snapshot
-    # will contain NO active filesystem handles or stale superblocks for these volumes.
-    if mountpoint -q /boot/efi 2>/dev/null; then
-        echo "Hibernation Safeguard: Unmounting /boot/efi..."
-        umount /boot/efi 2>/dev/null || { fuser -km /boot/efi 2>/dev/null; sleep 1; umount /boot/efi 2>/dev/null; }
-    fi
-
-    if mountpoint -q /boot 2>/dev/null; then
-        echo "Hibernation Safeguard: Unmounting /boot..."
-        umount /boot 2>/dev/null || { fuser -km /boot 2>/dev/null; sleep 1; umount /boot 2>/dev/null; }
-    fi
-
-    # 4. Strict Validation: Fail and abort hibernation if /boot or /boot/efi could not be unmounted
-    FAILED_UNMOUNT=false
-    if mountpoint -q /boot/efi 2>/dev/null; then
-        echo "ERROR: /boot/efi could not be unmounted prior to hibernation!" >&2
-        FAILED_UNMOUNT=true
-    fi
-    if mountpoint -q /boot 2>/dev/null; then
-        echo "ERROR: /boot could not be unmounted prior to hibernation!" >&2
-        FAILED_UNMOUNT=true
-    fi
-
-    if [ "$FAILED_UNMOUNT" = true ]; then
-        echo "CRITICAL: Aborting hibernation to prevent filesystem corruption!" >&2
-        mount /boot 2>/dev/null || true
-        mount /boot/efi 2>/dev/null || true
-        mount -a 2>/dev/null || true
-        kill -9 "$PPID" 2>/dev/null || true
-        exit 1
-    fi
-
-    # Optional safeguard against ACPI S4 poweroff hangs:
+    # 3. Optional safeguard against ACPI S4 poweroff hangs:
     if [ -f /sys/power/disk ]; then
         grep -q "shutdown" /sys/power/disk 2>/dev/null && echo "shutdown" > /sys/power/disk 2>/dev/null || true
     fi
 
 elif [ "$1" = "post" ] && [ "$2" = "hibernate" ]; then
-    echo "Hibernation Safeguard (__INSTALLER_NAME__): Resuming from hibernation, remounting boot filesystems..."
+    echo "Hibernation Safeguard (__INSTALLER_NAME__): Resuming from hibernation, clearing target records..."
 
-    # 1. Remount /boot and /boot/efi cleanly in userspace
-    systemctl restart boot.mount 2>/dev/null || mount /boot 2>/dev/null || mount -a 2>/dev/null || true
-    systemctl restart boot-efi.mount 2>/dev/null || mount /boot/efi 2>/dev/null || true
-    mount -a 2>/dev/null || true
-
-    # 2. Safely clean up targets in userspace after resume has succeeded
+    # 1. Safely clean up targets in userspace after resume has succeeded
     /usr/local/bin/hibernation-machine-id clear-targets
 fi
 """
@@ -1163,7 +1283,7 @@ def write_boot_cleanup_service(installer_name=INSTALLER_NAME):
 Description=Hibernation Safeguard Target Cleanup on Normal Boot
 Documentation=https://github.com/f-fix/x86-64-debian-hibernation-safeguard
 DefaultDependencies=no
-After=local-fs.target boot.mount
+After=local-fs.target
 Before=basic.target
 
 [Service]
@@ -1528,6 +1648,7 @@ SAVED_MAC=""
 SAVED_MAC_IFACE=""
 SAVED_KERNEL=""
 
+# Strictly READ-ONLY mount, read targets into memory, immediately unmount
 if [ -n "$BOOT_DEV" ] && mount -o ro "$BOOT_DEV" "$BOOT_MNT" 2>/dev/null; then
     if [ -f "$BOOT_MNT/initramfs_hib_id" ]; then
         . "$BOOT_MNT/initramfs_hib_id"
@@ -1815,11 +1936,8 @@ if [ "$HAS_MISMATCH" = true ]; then
 
     if [ "$user_input" = "force" ]; then
         echo "Forcing hibernation resume on mismatched hardware..."
-        # Clean targets before resuming to prevent stale files remaining after resume
-        if [ -n "$BOOT_DEV" ] && mount -o rw "$BOOT_DEV" "$BOOT_MNT" 2>/dev/null; then
-            rm -f "$BOOT_MNT/initramfs_hib_id" "$BOOT_MNT/grub_hib_id" "$BOOT_MNT/loader/sdboot_hib_id" "$BOOT_MNT/loader/gpd_sdboot_hib_id" 2>/dev/null
-            umount "$BOOT_MNT" 2>/dev/null || true
-        fi
+        mkdir -p /run/hibernation-safeguard
+        echo "force" > /run/hibernation-safeguard/action
         cleanup_boot_mnt
         exit 0
     fi
@@ -1885,19 +2003,8 @@ EOF_SAN
         fi
     done
 
-    if [ -n "$BOOT_DEV" ] && mount -o rw "$BOOT_DEV" "$BOOT_MNT" 2>/dev/null; then
-        rm -f "$BOOT_MNT/initramfs_hib_id"
-        rm -f "$BOOT_MNT/grub_hib_id"
-        rm -f "$BOOT_MNT/loader/sdboot_hib_id"
-        rm -f "$BOOT_MNT/loader/gpd_sdboot_hib_id"
-        umount "$BOOT_MNT" 2>/dev/null || true
-    fi
-else
-    # Matching normal resume: clean targets from boot volume before resuming
-    if [ -n "$BOOT_DEV" ] && mount -o rw "$BOOT_DEV" "$BOOT_MNT" 2>/dev/null; then
-        rm -f "$BOOT_MNT/initramfs_hib_id" "$BOOT_MNT/grub_hib_id" "$BOOT_MNT/loader/sdboot_hib_id" "$BOOT_MNT/loader/gpd_sdboot_hib_id" 2>/dev/null
-        umount "$BOOT_MNT" 2>/dev/null || true
-    fi
+    mkdir -p /run/hibernation-safeguard
+    echo "discard" > /run/hibernation-safeguard/action
 fi
 
 cleanup_boot_mnt
@@ -1913,6 +2020,7 @@ exit 0
 
 def compile_images(has_grub):
     print("=== 7. Compiling Active Image Assets ===")
+    ensure_boot_rw()
     if has_grub:
         run_command(["update-grub"], capture_output=False)
     run_command(["update-initramfs", "-u", "-k", "all"], capture_output=False)
@@ -1925,6 +2033,7 @@ def install(installer_name=INSTALLER_NAME):
         "Note: Tested so far on Debian Forky/Sid (Debian 14 / unstable); should work on other x86-64 Debian flavors."
     )
     print()
+    ensure_boot_rw()
 
     # Ensure ethtool is available if apt-get is accessible
     if not shutil.which("ethtool") and shutil.which("apt-get"):
@@ -2213,6 +2322,11 @@ def show_status(installer_name=INSTALLER_NAME):
 
 
 def main():
+    # Handle help requests by paging the full embedded README.md via pydoc.pager
+    if len(sys.argv) > 1 and sys.argv[1] in ["-h", "--help", "help"]:
+        pydoc.pager(README_DOC)
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(
         prog=INSTALLER_NAME,
         description=(

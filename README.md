@@ -6,22 +6,20 @@ Repository: [https://github.com/f-fix/x86-64-debian-hibernation-safeguard](https
 
 ---
 
-## 🎯 Overview
+## Overview
 
 Hibernating Linux writes the complete active memory state and kernel registers to swap storage. When using portable installations (e.g., Debian installed on an external USB SSD, thumb drive, or external NVMe enclosure) or moving drives between different machines, resuming on mismatched physical hardware results in driver hangs, memory map corruption, and kernel panics.
 
-Furthermore, standard Linux hibernation workflows risk filesystem corruption if `/boot` or `/boot/efi` remain mounted when the memory snapshot is taken, or if early boot resume prompts leak full disk encryption passphrases.
-
 `x86-64-debian-hibernation-safeguard` provides an automated **dual-stage hardware verification and isolation framework**:
-1. **Early Bootloader Validation (GRUB / systemd-boot):** Compares the machine's SMBIOS Processor Information against the saved hibernation record before the kernel boots. Disables resume parameters and triggers kernel rollback if a mismatch is detected.
-2. **Early Initramfs Validation:** Mounts `/boot` strictly read-only, immediately unmounts it, and validates Kernel version, CPU model, numeric RAM capacity (with dynamic tolerance for Intel GPU / EFI stolen memory), and permanent hardware MAC addresses (filtering out randomized/locally-administered MACs).
-3. **Safe Interactive Confirmation (Anti-Passphrase Leak):** Uses a dedicated non-password interactive filter loop in both Plymouth and text consoles. Keystrokes are filtered to accept only `yes`+Enter or `no`+Enter with live visual feedback (`> `, `> y`, `> ye`, `> yes`), backspace/delete editing, and **zero plaintext echoing** of passwords typed in error.
+1. **Early Bootloader Validation (GRUB / systemd-boot):** Compares the machine's SMBIOS DMI information (vendor, model, BIOS version, baseboard, and processor) against the saved hibernation record before the kernel boots. Disables automatic timer countdowns, displays changed hardware attributes, and presents safe recovery options (Safe Power Off preselected, Clean Boot, and Force Resume).
+2. **Early Initramfs Validation:** Mounts `/boot` strictly read-only for a few milliseconds, immediately unmounts it, and validates Kernel version, DMI parameters, CPU model, numeric RAM capacity (with dynamic tolerance for stolen memory), and permanent hardware MAC addresses.
+3. **Safe Interactive Confirmation (Anti-Passphrase Leak):** Uses a dedicated non-password interactive filter loop with a compiled C evdev listener supporting both Plymouth splash screens (live in-place prompt line updates) and text consoles. Requires full words (`yes`, `no`, `force`) with **zero plaintext echoing** of passwords typed in error.
 4. **Resilient Discard (LUKS, LVM, and Plain Swap):** Selecting discard neutralizes resume binaries, zeroes `/sys/power/resume`, and sanitizes swap suspend signatures (`S1SUSPEND`/`S2SUSPEND` -> `SWAPSPACE2`) on plain partitions and inside LUKS/LVM volumes once unlocked.
-5. **Pre-Hibernation Filesystem Isolation:** Unmounts `/boot` and `/boot/efi` before taking the memory snapshot (aborting hibernation if unmount fails), and cleanly remounts them in userspace upon resume.
+5. **Strict Early Read-Only Isolation:** Never writes to or mounts `/boot` rw in early boot. Communicates state transitions via `/run` tmpfs, allowing userspace services to manage all target files safely.
 
 ---
 
-## 💻 Compatibility & Tested Platforms
+## Compatibility & Tested Platforms
 
 * **Tested Platform:** **Debian Forky/Sid (Debian 14 / unstable)** on `x86_64`.
 * **Other Flavors:** While architected using standard Linux kernel, procfs, sysfs, and `initramfs-tools` primitives that should work across other Debian versions and derivatives on `x86_64`, it is **currently only tested on Debian Forky/Sid**.
@@ -30,7 +28,7 @@ Furthermore, standard Linux hibernation workflows risk filesystem corruption if 
 
 ---
 
-## 🛠️ Usage
+## Usage
 
 ### 1. Check Installation Status (`--status`)
 To inspect your current system hardware identity and check which safeguard components and hooks are installed without making any modifications:
@@ -39,37 +37,8 @@ To inspect your current system hardware identity and check which safeguard compo
 python3 x86-64-debian-hibernation-safeguard.py --status
 ```
 
-Example status output:
-```text
-=== Hardware Hibernation Safeguard Status (x86-64-debian-hibernation-safeguard.py) ===
-Note: Tested so far on Debian Forky/Sid (Debian 14 / unstable); should work on other x86-64 Debian flavors.
-
-Components:
-  - Machine ID helper (/usr/local/bin/hibernation-machine-id)        : [INSTALLED]
-  - Systemd sleep hook (/lib/systemd/system-sleep/...)               : [INSTALLED]
-  - Initramfs check hook (/etc/initramfs-tools/scripts/local-top/..): [INSTALLED]
-  - Initramfs modules config (sentinel block in /etc/.../modules)    : [CONFIGURED]
-  - Initramfs firmware config (zz-hibernation-safeguard.conf)        : [CONFIGURED]
-  - GRUB safeguard hook (sentinel block in /etc/grub.d/40_custom)    : [CONFIGURED]
-
-Live System Hardware Identity:
-  - CPU Model       : Intel(R) Core(TM) m3-7Y30 CPU @ 1.00GHz
-  - Memory          : 8047040kB
-  - Active Kernel   : 6.12.107+deb13-amd64
-  - Permanent MAC   : b4:69:21:a8:12:6d (interface: wlan0)
-
-Saved Hibernation Targets:
-  - /boot/grub_hib_id      : [NONE] (clean / not hibernated)
-  - /boot/initramfs_hib_id : [NONE] (clean / not hibernated)
-
-Power Management Configuration:
-  - /sys/power/disk        : shutdown
-
-Safeguard Overall Status   : [ACTIVE & FULLY INSTALLED by x86-64-debian-hibernation-safeguard.py]
-```
-
 ### 2. Deploy the Safeguard (`--install`)
-To install the hooks, purge legacy artifacts, configure bootloader integration, and update initramfs/boot images:
+To install the hooks, compile the C evdev prompt binary, configure bootloader integration, and update initramfs/boot images:
 
 ```bash
 sudo python3 x86-64-debian-hibernation-safeguard.py --install
@@ -77,15 +46,24 @@ sudo python3 x86-64-debian-hibernation-safeguard.py --install
 
 *(Note: If executed without root, the script automatically attempts privilege self-elevation via `sudo`, `doas`, or `pkexec`).*
 
+### 3. Display Documentation / Help (`--help` or `-h`)
+To display this full manual using the standard Python help pager:
+
+```bash
+python3 x86-64-debian-hibernation-safeguard.py --help
+```
+
 ---
 
-## 🔍 Architecture & Installed Files
+## Architecture & Installed Files
 
 All installed scripts, configuration drop-ins, and guard blocks are traceable back to `x86-64-debian-hibernation-safeguard.py`:
 
-* **`/usr/local/bin/hibernation-machine-id`**: Helper that discovers permanent hardware identity (SMBIOS Processor string, MemTotal, physical MAC), saves targets on hibernate, and clears them on resume. Includes a `--help` option identifying `x86-64-debian-hibernation-safeguard.py`.
-* **`/lib/systemd/system-sleep/hibernation-hardware-tag`**: Systemd sleep hook that saves target parameters, cleanly unmounts `/boot` and `/boot/efi` prior to memory snapshotting, and remounts them upon restore. Includes `--help` documentation.
-* **`/etc/initramfs-tools/scripts/local-top/hibernation_resume_check`**: Early initramfs hook that mounts `/boot` strictly read-only, checks hardware parameters, and executes the non-password interactive prompt if a mismatch is detected.
+* **`/usr/local/bin/hibernation-machine-id`**: Helper that discovers permanent hardware identity (DMI strings, CPU, MemTotal, physical MAC), saves targets on hibernate, and clears them on resume. Includes a `--help` option identifying `x86-64-debian-hibernation-safeguard.py`.
+* **`/lib/systemd/system-sleep/hibernation-hardware-tag`**: Systemd sleep hook that saves target parameters prior to hibernation and cleans them up upon restore.
+* **`/lib/systemd/system/hibernation-safeguard-cleanup.service`**: Oneshot systemd service running at `basic.target` on every cold boot and clean startup to guarantee stale target records are cleared.
+* **`/usr/local/bin/hibernation-resume-prompt`**: Compiled native C micro-daemon for direct evdev, tty, and console input handling with live Plymouth bootsplash message line updates.
+* **`/etc/initramfs-tools/scripts/local-top/hibernation_resume_check`**: Early initramfs hook that mounts `/boot` strictly read-only, checks hardware parameters, and executes the interactive prompt if a mismatch is detected.
 * **`/etc/initramfs-tools/modules`**: Bounded by sentinel comments:
   ```text
   ### BEGIN HIBERNATION SAFEGUARD MODULES (installed by x86-64-debian-hibernation-safeguard.py) ###
@@ -102,7 +80,7 @@ All installed scripts, configuration drop-ins, and guard blocks are traceable ba
 
 ---
 
-## 🔧 Troubleshooting Hibernation Hangs
+## Troubleshooting Hibernation Hangs
 
 If your machine fails to complete hibernation (e.g. screen turns black, system freezes with cooling fans spinning at 100%), isolate the failing subsystem using the kernel power management testing interface:
 
