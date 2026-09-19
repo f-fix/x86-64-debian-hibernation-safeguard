@@ -173,13 +173,7 @@ If the hang occurs during final power-down, `x86-64-debian-hibernation-safeguard
 Parts of this code were written (including some initial ones that began in other, separate projects) with assistance from LLM-integrated coding tools. If you don't like it, feel free to use other software or rewrite parts you dislike. PRs are welcome!
 """
 
-C_PROMPT_SOURCE = r"""/*
- * hibernation-resume-prompt.c
- * Universal Direct evdev, tty & console interactive prompt for initramfs
- * Supports live Plymouth bootsplash message updates and text console
- * Installed by x86-64-debian-hibernation-safeguard.py
- */
-
+C_PROMPT_SOURCE = r"""
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -198,9 +192,19 @@ C_PROMPT_SOURCE = r"""/*
 
 #define MAX_FDS 64
 
+struct ev_dev {
+    int fd;
+    char path[64];
+};
+
+static struct ev_dev ev_devs[MAX_FDS];
+static int num_ev_devs = 0;
+
 static int out_fds[8];
 static int num_out_fds = 0;
 static int plymouth_active = 0;
+
+static const char *PROMPT_PREFIX = "Lose unmatched hibernation? Yes=new/No=off/Force=resume: > ";
 
 static void add_out_fd(int fd) {
     if (fd < 0) return;
@@ -255,9 +259,33 @@ static void update_plymouth_msg(const char *msg) {
 
 static void update_plymouth_prompt(const char *buf) {
     if (plymouth_active) {
-        char line[128];
-        snprintf(line, sizeof(line), "Confirm action: > %s", buf);
+        char line[160];
+        snprintf(line, sizeof(line), "%s%s", PROMPT_PREFIX, buf);
         update_plymouth_msg(line);
+    }
+}
+
+static void scan_and_add_evdevs(void) {
+    glob_t g;
+    if (glob("/dev/input/event*", 0, NULL, &g) == 0) {
+        for (size_t i = 0; i < g.gl_pathc; i++) {
+            int already_open = 0;
+            for (int j = 0; j < num_ev_devs; j++) {
+                if (strcmp(ev_devs[j].path, g.gl_pathv[i]) == 0) {
+                    already_open = 1;
+                    break;
+                }
+            }
+            if (!already_open && num_ev_devs < MAX_FDS - 8) {
+                int fd = open(g.gl_pathv[i], O_RDONLY | O_NONBLOCK);
+                if (fd >= 0) {
+                    ev_devs[num_ev_devs].fd = fd;
+                    strncpy(ev_devs[num_ev_devs].path, g.gl_pathv[i], sizeof(ev_devs[num_ev_devs].path) - 1);
+                    num_ev_devs++;
+                }
+            }
+        }
+        globfree(&g);
     }
 }
 
@@ -299,6 +327,16 @@ static char keycode_to_char(int code, int shift) {
         case KEY_8: return '8';
         case KEY_9: return '9';
         case KEY_0: return '0';
+        case KEY_KP1: return '1';
+        case KEY_KP2: return '2';
+        case KEY_KP3: return '3';
+        case KEY_KP4: return '4';
+        case KEY_KP5: return '5';
+        case KEY_KP6: return '6';
+        case KEY_KP7: return '7';
+        case KEY_KP8: return '8';
+        case KEY_KP9: return '9';
+        case KEY_KP0: return '0';
         case KEY_SPACE: return ' ';
         default: return 0;
     }
@@ -341,44 +379,12 @@ int main(int argc, char **argv) {
         out_str("  * no    - Power off immediately (preserves session)\n");
         out_str("  * force - Force resume attempt anyway (risk of panic)\n");
         out_str("--------------------------------------------------\n");
-        out_str("Confirm action: > ");
+        out_str(PROMPT_PREFIX);
     } else {
         update_plymouth_prompt("");
     }
 
-    struct pollfd p_fds[MAX_FDS];
-    int is_evdev[MAX_FDS];
-    int num_p_fds = 0;
-
-    set_nonblocking(STDIN_FILENO);
-    p_fds[num_p_fds].fd = STDIN_FILENO;
-    p_fds[num_p_fds].events = POLLIN;
-    is_evdev[num_p_fds] = 0;
-    num_p_fds++;
-
-    for (int i = 0; i < num_out_fds; i++) {
-        if (out_fds[i] >= 0 && out_fds[i] != STDOUT_FILENO && out_fds[i] != STDIN_FILENO) {
-            set_nonblocking(out_fds[i]);
-            p_fds[num_p_fds].fd = out_fds[i];
-            p_fds[num_p_fds].events = POLLIN;
-            is_evdev[num_p_fds] = 0;
-            num_p_fds++;
-        }
-    }
-
-    glob_t g;
-    if (glob("/dev/input/event*", 0, NULL, &g) == 0) {
-        for (size_t i = 0; i < g.gl_pathc && num_p_fds < MAX_FDS - 1; i++) {
-            int fd = open(g.gl_pathv[i], O_RDONLY | O_NONBLOCK);
-            if (fd >= 0) {
-                p_fds[num_p_fds].fd = fd;
-                p_fds[num_p_fds].events = POLLIN;
-                is_evdev[num_p_fds] = 1;
-                num_p_fds++;
-            }
-        }
-        globfree(&g);
-    }
+    scan_and_add_evdevs();
 
     char buffer[64];
     int buf_len = 0;
@@ -387,11 +393,50 @@ int main(int argc, char **argv) {
     int shift_active = 0;
 
     while (1) {
-        int ret = poll(p_fds, num_p_fds, 500);
+        struct pollfd p_fds[MAX_FDS];
+        int fd_map_type[MAX_FDS]; // 0 = tty/stdin, 1 = evdev
+        int fd_map_idx[MAX_FDS];
+        int num_p_fds = 0;
+
+        // Add STDIN
+        set_nonblocking(STDIN_FILENO);
+        p_fds[num_p_fds].fd = STDIN_FILENO;
+        p_fds[num_p_fds].events = POLLIN;
+        fd_map_type[num_p_fds] = 0;
+        fd_map_idx[num_p_fds] = -1;
+        num_p_fds++;
+
+        // Add ttys
+        for (int i = 0; i < num_out_fds; i++) {
+            if (out_fds[i] >= 0 && out_fds[i] != STDOUT_FILENO && out_fds[i] != STDIN_FILENO) {
+                set_nonblocking(out_fds[i]);
+                p_fds[num_p_fds].fd = out_fds[i];
+                p_fds[num_p_fds].events = POLLIN;
+                fd_map_type[num_p_fds] = 0;
+                fd_map_idx[num_p_fds] = i;
+                num_p_fds++;
+            }
+        }
+
+        // Add evdevs
+        for (int i = 0; i < num_ev_devs && num_p_fds < MAX_FDS; i++) {
+            if (ev_devs[i].fd >= 0) {
+                p_fds[num_p_fds].fd = ev_devs[i].fd;
+                p_fds[num_p_fds].events = POLLIN;
+                fd_map_type[num_p_fds] = 1;
+                fd_map_idx[num_p_fds] = i;
+                num_p_fds++;
+            }
+        }
+
+        int ret = poll(p_fds, num_p_fds, 250);
         if (ret < 0) {
             if (errno == EINTR) continue;
             break;
         }
+
+        // Re-scan for new input devices periodically
+        scan_and_add_evdevs();
 
         if (ret == 0) {
             continue;
@@ -400,7 +445,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < num_p_fds; i++) {
             if (!(p_fds[i].revents & POLLIN)) continue;
 
-            if (!is_evdev[i]) {
+            if (fd_map_type[i] == 0) {
                 char ch;
                 while (read(p_fds[i].fd, &ch, 1) == 1) {
                     if (ch == '\r' || ch == '\n') {
@@ -428,8 +473,8 @@ int main(int argc, char **argv) {
                             }
                             return 2; // 2 = force resume
                         } else {
-                            out_str("\n[INVALID INPUT] Please type 'yes', 'no', or 'force' followed by Enter.\nConfirm action: > ");
-                            update_plymouth_msg("[INVALID INPUT] Type 'yes', 'no', or 'force' + Enter.");
+                            out_str("\n[INVALID INPUT] Please type 'yes', 'no', or 'force' followed by Enter.\n");
+                            out_str(PROMPT_PREFIX);
                             buf_len = 0;
                             buffer[0] = '\0';
                             update_plymouth_prompt(buffer);
@@ -493,8 +538,8 @@ int main(int argc, char **argv) {
                                     }
                                     return 2; // 2 = force resume
                                 } else {
-                                    out_str("\n[INVALID INPUT] Please type 'yes', 'no', or 'force' followed by Enter.\nConfirm action: > ");
-                                    update_plymouth_msg("[INVALID INPUT] Type 'yes', 'no', or 'force' + Enter.");
+                                    out_str("\n[INVALID INPUT] Please type 'yes', 'no', or 'force' followed by Enter.\n");
+                                    out_str(PROMPT_PREFIX);
                                     buf_len = 0;
                                     buffer[0] = '\0';
                                     update_plymouth_prompt(buffer);
@@ -1593,7 +1638,7 @@ def write_initramfs_hook(boot_uuid, installer_name=INSTALLER_NAME):
 # Universal Hardware Hibernation Resume Validation Hook
 # Note: Tested so far on Debian Forky/Sid (Debian 14 / unstable)
 
-PREREQ=""
+PREREQ="udev"
 prereqs() { echo "$PREREQ"; }
 case $1 in
     -h|--help|help)
@@ -1859,7 +1904,7 @@ if [ "$HAS_MISMATCH" = true ]; then
     modprobe i8042 2>/dev/null || true
     modprobe hid_generic 2>/dev/null || true
     modprobe usbhid 2>/dev/null || true
-    command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
+    command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=5 2>/dev/null || true
 
     user_input=""
 
@@ -1963,7 +2008,7 @@ if [ "$HAS_MISMATCH" = true ]; then
     cat << 'EOF_SAN' > /scripts/local-premount/resume
 #!/bin/sh
 # Sanitizer installed dynamically by __INSTALLER_NAME__ during hibernation discard
-PREREQ=""
+PREREQ="udev"
 prereqs() { echo "$PREREQ"; }
 case $1 in prereqs) prereqs; exit 0;; esac
 
