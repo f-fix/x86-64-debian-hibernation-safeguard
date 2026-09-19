@@ -21,7 +21,8 @@ Comprehensive DMI/SMBIOS (vendor/model/bios/board/cpu) cross-validation across G
 Standard SMBIOS byte-offset retrieval in GRUB with automatic skip on unretrievable/empty fields.
 GRUB mismatch screen with 30-second interruptible reading pause and display of changed fields only.
 Functional GRUB menu entries preserving full default hardware kernel parameters and resume= targets with explicit boot commands.
-Automatic cleanup service guaranteeing deletion of leftover hibernation files on every normal (non-resume) boot.
+Guaranteed early initramfs deletion of hibernation targets upon resume or discard before memory restoration.
+Multi-layer fallback cleanup service and post-sleep hooks guaranteeing deletion of leftover hibernation files.
 Seamless kernel rollback/override handling on systemd-boot and GRUB during hibernation resume with automatic restoration for future boots.
 Strict bootloader isolation ensuring systemd-boot never hijacks resumption if the current session booted via GRUB or other loaders.
 Robust physical MAC address discovery supporting Ethernet, Wi-Fi, and userspace-configured links with IEEE 802 universal/local bit validation.
@@ -831,7 +832,7 @@ def write_c_prompt_daemon(installer_name=INSTALLER_NAME):
         print("  [SKIP] gcc not found; will use shell fallback for interactive prompt.")
 
 
-def write_machine_id_helper(installer_name=INSTALLER_NAME):
+def write_machine_id_helper(boot_uuid, installer_name=INSTALLER_NAME):
     print("=== 3. Creating Hardware Hibernation Machine ID Helper ===")
     helper_path = Path("/usr/local/bin/hibernation-machine-id")
     helper_template = r"""#!/bin/sh
@@ -1027,6 +1028,24 @@ fi
 
 if [ "$1" = "clear-targets" ]; then
     rm -f /boot/grub_hib_id /boot/initramfs_hib_id /boot/loader/sdboot_hib_id /boot/loader/gpd_sdboot_hib_id 2>/dev/null
+
+    # If /boot is a separate partition, check if target partition holds uncleaned files
+    _boot_uuid="__BOOT_UUID__"
+    if [ -n "$_boot_uuid" ]; then
+        _bdev=$(blkid -U "$_boot_uuid" 2>/dev/null)
+        if [ -n "$_bdev" ] && [ -b "$_bdev" ]; then
+            if ! mountpoint -q /boot 2>/dev/null; then
+                _tmp_c="/tmp/clear_boot_target_mnt"
+                mkdir -p "$_tmp_c"
+                if mount -o rw "$_bdev" "$_tmp_c" 2>/dev/null; then
+                    rm -f "$_tmp_c/grub_hib_id" "$_tmp_c/initramfs_hib_id" "$_tmp_c/loader/sdboot_hib_id" "$_tmp_c/loader/gpd_sdboot_hib_id" 2>/dev/null
+                    umount "$_tmp_c" 2>/dev/null || true
+                fi
+                rmdir "$_tmp_c" 2>/dev/null || true
+            fi
+        fi
+    fi
+
     if was_booted_by_systemd_boot || [ -f /boot/loader/sdboot_hib_id ]; then
         if command -v bootctl >/dev/null 2>&1; then
             bootctl set-default "" 2>/dev/null || true
@@ -1034,7 +1053,9 @@ if [ "$1" = "clear-targets" ]; then
     fi
 fi
 """
-    helper_content = helper_template.replace("__INSTALLER_NAME__", installer_name)
+    helper_content = helper_template.replace(
+        "__INSTALLER_NAME__", installer_name
+    ).replace("__BOOT_UUID__", boot_uuid)
     helper_path.parent.mkdir(parents=True, exist_ok=True)
     helper_path.write_text(helper_content)
     helper_path.chmod(0o755)
@@ -1121,8 +1142,8 @@ elif [ "$1" = "post" ] && [ "$2" = "hibernate" ]; then
     echo "Hibernation Safeguard (__INSTALLER_NAME__): Resuming from hibernation, remounting boot filesystems..."
 
     # 1. Remount /boot and /boot/efi cleanly in userspace
-    mount /boot 2>/dev/null || true
-    mount /boot/efi 2>/dev/null || true
+    systemctl restart boot.mount 2>/dev/null || mount /boot 2>/dev/null || mount -a 2>/dev/null || true
+    systemctl restart boot-efi.mount 2>/dev/null || mount /boot/efi 2>/dev/null || true
     mount -a 2>/dev/null || true
 
     # 2. Safely clean up targets in userspace after resume has succeeded
@@ -1142,7 +1163,7 @@ def write_boot_cleanup_service(installer_name=INSTALLER_NAME):
 Description=Hibernation Safeguard Target Cleanup on Normal Boot
 Documentation=https://github.com/f-fix/x86-64-debian-hibernation-safeguard
 DefaultDependencies=no
-After=local-fs.target
+After=local-fs.target boot.mount
 Before=basic.target
 
 [Service]
@@ -1794,6 +1815,11 @@ if [ "$HAS_MISMATCH" = true ]; then
 
     if [ "$user_input" = "force" ]; then
         echo "Forcing hibernation resume on mismatched hardware..."
+        # Clean targets before resuming to prevent stale files remaining after resume
+        if [ -n "$BOOT_DEV" ] && mount -o rw "$BOOT_DEV" "$BOOT_MNT" 2>/dev/null; then
+            rm -f "$BOOT_MNT/initramfs_hib_id" "$BOOT_MNT/grub_hib_id" "$BOOT_MNT/loader/sdboot_hib_id" "$BOOT_MNT/loader/gpd_sdboot_hib_id" 2>/dev/null
+            umount "$BOOT_MNT" 2>/dev/null || true
+        fi
         cleanup_boot_mnt
         exit 0
     fi
@@ -1866,6 +1892,12 @@ EOF_SAN
         rm -f "$BOOT_MNT/loader/gpd_sdboot_hib_id"
         umount "$BOOT_MNT" 2>/dev/null || true
     fi
+else
+    # Matching normal resume: clean targets from boot volume before resuming
+    if [ -n "$BOOT_DEV" ] && mount -o rw "$BOOT_DEV" "$BOOT_MNT" 2>/dev/null; then
+        rm -f "$BOOT_MNT/initramfs_hib_id" "$BOOT_MNT/grub_hib_id" "$BOOT_MNT/loader/sdboot_hib_id" "$BOOT_MNT/loader/gpd_sdboot_hib_id" 2>/dev/null
+        umount "$BOOT_MNT" 2>/dev/null || true
+    fi
 fi
 
 cleanup_boot_mnt
@@ -1918,7 +1950,7 @@ def install(installer_name=INSTALLER_NAME):
     ) = gather_machine_layout()
     write_c_prompt_daemon(installer_name)
     configure_initramfs_framework(installer_name)
-    write_machine_id_helper(installer_name)
+    write_machine_id_helper(boot_uuid, installer_name)
     write_systemd_sleep_hook(installer_name)
     write_boot_cleanup_service(installer_name)
     if has_grub:
