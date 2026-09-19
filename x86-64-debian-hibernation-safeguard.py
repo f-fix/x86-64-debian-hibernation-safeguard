@@ -20,15 +20,16 @@ Strict isolation of /boot and /boot/efi to eliminate post-resume filesystem corr
 Comprehensive DMI/SMBIOS (vendor/model/bios/board/cpu) cross-validation across GRUB and initramfs.
 Standard SMBIOS byte-offset retrieval in GRUB with automatic skip on unretrievable/empty fields.
 GRUB mismatch screen with 30-second interruptible reading pause and display of changed fields only.
-Functional GRUB menu entries with full kernel/initrd parameters and explicit boot commands.
+Functional GRUB menu entries preserving full default hardware kernel parameters with explicit boot commands.
 Automatic cleanup service guaranteeing deletion of leftover hibernation files on every normal (non-resume) boot.
 Seamless kernel rollback/override handling on systemd-boot and GRUB during hibernation resume with automatic restoration for future boots.
 Strict bootloader isolation ensuring systemd-boot never hijacks resumption if the current session booted via GRUB or other loaders.
 Robust physical MAC address discovery supporting Ethernet, Wi-Fi, and userspace-configured links with IEEE 802 universal/local bit validation.
-Automatic bundling of ethtool into initramfs for permanent EEPROM MAC querying.
+Dedicated compiled C micro-daemon for direct evdev/console keyboard capture in early initramfs.
+Automatic bundling of ethtool and C resume prompt binary into initramfs.
 Interactive mismatch recovery menus:
   - GRUB: Pure ASCII menu with disabled countdown, safe Power Off default/preselected, Discard (clean boot), and Force Resume options.
-  - Initramfs: Distinct non-password interactive prompt requiring fully typed words ('yes', 'no', 'force') to prevent accidental single-key passphrase triggers.
+  - Initramfs: Distinct non-password interactive prompt requiring fully typed words ('yes', 'no', 'force') with live typing echo and evdev support.
 """
 
 import os
@@ -56,7 +57,354 @@ SAFEGUARD_MODULES = [
     "mac80211",
     "cfg80211",
     "dm_mod",
+    "evdev",
+    "i8042",
+    "button",
 ]
+
+C_PROMPT_SOURCE = r"""/*
+ * hibernation-resume-prompt.c
+ * Direct evdev & console interactive confirmation prompt for initramfs
+ * Installed by x86-64-debian-hibernation-safeguard.py
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <string.h>
+#include <stdarg.h>
+#include <ctype.h>
+#include <glob.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/reboot.h>
+#include <sys/ioctl.h>
+#include <linux/input.h>
+#include <termios.h>
+
+static int console_fd = -1;
+
+static void out_str(const char *s) {
+    if (console_fd >= 0) {
+        write(console_fd, s, strlen(s));
+    } else {
+        write(STDOUT_FILENO, s, strlen(s));
+    }
+}
+
+static void out_char(char c) {
+    char b[2] = { c, '\0' };
+    out_str(b);
+}
+
+static char keycode_to_char(int code, int shift) {
+    switch (code) {
+        case KEY_A: return shift ? 'A' : 'a';
+        case KEY_B: return shift ? 'B' : 'b';
+        case KEY_C: return shift ? 'C' : 'c';
+        case KEY_D: return shift ? 'D' : 'd';
+        case KEY_E: return shift ? 'E' : 'e';
+        case KEY_F: return shift ? 'F' : 'f';
+        case KEY_G: return shift ? 'G' : 'g';
+        case KEY_H: return shift ? 'H' : 'h';
+        case KEY_I: return shift ? 'I' : 'i';
+        case KEY_J: return shift ? 'J' : 'j';
+        case KEY_K: return shift ? 'K' : 'k';
+        case KEY_L: return shift ? 'L' : 'l';
+        case KEY_M: return shift ? 'M' : 'm';
+        case KEY_N: return shift ? 'N' : 'n';
+        case KEY_O: return shift ? 'O' : 'o';
+        case KEY_P: return shift ? 'P' : 'p';
+        case KEY_Q: return shift ? 'Q' : 'q';
+        case KEY_R: return shift ? 'R' : 'r';
+        case KEY_S: return shift ? 'S' : 's';
+        case KEY_T: return shift ? 'T' : 't';
+        case KEY_U: return shift ? 'U' : 'u';
+        case KEY_V: return shift ? 'V' : 'v';
+        case KEY_W: return shift ? 'W' : 'w';
+        case KEY_X: return shift ? 'X' : 'x';
+        case KEY_Y: return shift ? 'Y' : 'y';
+        case KEY_Z: return shift ? 'Z' : 'z';
+        case KEY_SPACE: return ' ';
+        default: return 0;
+    }
+}
+
+static int scan_inputs(struct pollfd *fds, int max_fds) {
+    for (int i = 0; i < max_fds; i++) {
+        if (fds[i].fd >= 0 && fds[i].fd != STDIN_FILENO && fds[i].fd != console_fd) {
+            close(fds[i].fd);
+            fds[i].fd = -1;
+        }
+    }
+    glob_t g;
+    int num_fds = 0;
+    if (glob("/dev/input/event*", 0, NULL, &g) == 0) {
+        for (size_t i = 0; i < g.gl_pathc && num_fds < max_fds; i++) {
+            int fd = open(g.gl_pathv[i], O_RDONLY | O_NONBLOCK);
+            if (fd >= 0) {
+                fds[num_fds].fd = fd;
+                fds[num_fds].events = POLLIN;
+                num_fds++;
+            }
+        }
+        globfree(&g);
+    }
+    return num_fds;
+}
+
+int main(int argc, char **argv) {
+    console_fd = open("/dev/console", O_RDWR | O_NOCTTY);
+    if (console_fd < 0) {
+        console_fd = open("/dev/tty0", O_RDWR | O_NOCTTY);
+    }
+
+    struct termios old_tio, new_tio;
+    int tio_saved = 0;
+    if (console_fd >= 0 && tcgetattr(console_fd, &old_tio) == 0) {
+        new_tio = old_tio;
+        new_tio.c_lflag &= (~ICANON & ~ECHO);
+        new_tio.c_cc[VMIN] = 1;
+        new_tio.c_cc[VTIME] = 0;
+        tcsetattr(console_fd, TCSANOW, &new_tio);
+        tio_saved = 1;
+    }
+
+    out_str("\n");
+    out_str("==================================================\n");
+    out_str("*** NOTICE: THIS IS NOT A DISK PASSWORD PROMPT ***\n");
+    out_str("*** DO NOT TYPE YOUR DISK ENCRYPTION PASSWORD  ***\n");
+    out_str("==================================================\n");
+    out_str("Options (type full word + Enter):\n");
+    out_str("  * yes   - Discard hibernation snapshot and boot cleanly\n");
+    out_str("  * no    - Power off immediately (preserves session)\n");
+    out_str("  * force - Force resume attempt anyway (risk of panic)\n");
+    out_str("--------------------------------------------------\n");
+    out_str("Confirm action: > ");
+
+    struct pollfd fds[36];
+    for (int i = 0; i < 36; i++) fds[i].fd = -1;
+
+    int num_ev_fds = scan_inputs(fds, 32);
+
+    int stdin_idx = -1;
+    if (isatty(STDIN_FILENO)) {
+        stdin_idx = num_ev_fds;
+        fds[stdin_idx].fd = STDIN_FILENO;
+        fds[stdin_idx].events = POLLIN;
+        num_ev_fds++;
+    }
+
+    int console_idx = -1;
+    if (console_fd >= 0) {
+        console_idx = num_ev_fds;
+        fds[console_idx].fd = console_fd;
+        fds[console_idx].events = POLLIN;
+        num_ev_fds++;
+    }
+
+    char buffer[64];
+    int buf_len = 0;
+    memset(buffer, 0, sizeof(buffer));
+
+    int shift_active = 0;
+
+    while (1) {
+        int ret = poll(fds, num_ev_fds, 1000);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        if (ret == 0) {
+            // Periodic re-scan for newly plugged USB keyboards
+            int curr_extra = 0;
+            if (stdin_idx >= 0) curr_extra++;
+            if (console_idx >= 0) curr_extra++;
+            num_ev_fds = scan_inputs(fds, 32);
+            if (stdin_idx >= 0) {
+                fds[num_ev_fds].fd = STDIN_FILENO;
+                fds[num_ev_fds].events = POLLIN;
+                stdin_idx = num_ev_fds++;
+            }
+            if (console_idx >= 0) {
+                fds[num_ev_fds].fd = console_fd;
+                fds[num_ev_fds].events = POLLIN;
+                console_idx = num_ev_fds++;
+            }
+            continue;
+        }
+
+        for (int i = 0; i < num_ev_fds; i++) {
+            if (!(fds[i].revents & POLLIN)) continue;
+
+            if (i == stdin_idx || i == console_idx) {
+                char ch;
+                while (read(fds[i].fd, &ch, 1) == 1) {
+                    if (ch == '\r' || ch == '\n') {
+                        // Check buffer
+                        if (strcasecmp(buffer, "yes") == 0) {
+                            out_str("\nSelected: Discard hibernation snapshot and boot cleanly.\n");
+                            if (tio_saved) tcsetattr(console_fd, TCSANOW, &old_tio);
+                            return 0; // 0 = yes / discard
+                        } else if (strcasecmp(buffer, "no") == 0) {
+                            out_str("\nSelected: Power off machine.\n");
+                            if (tio_saved) tcsetattr(console_fd, TCSANOW, &old_tio);
+                            return 1; // 1 = no / poweroff
+                        } else if (strcasecmp(buffer, "force") == 0) {
+                            out_str("\nSelected: Force resume anyway.\n");
+                            if (tio_saved) tcsetattr(console_fd, TCSANOW, &old_tio);
+                            return 2; // 2 = force resume
+                        } else {
+                            out_str("\n[INVALID INPUT] Please type 'yes', 'no', or 'force' followed by Enter.\nConfirm action: > ");
+                            buf_len = 0;
+                            buffer[0] = '\0';
+                        }
+                    } else if (ch == 127 || ch == '\b') {
+                        if (buf_len > 0) {
+                            buf_len--;
+                            buffer[buf_len] = '\0';
+                            out_str("\b \b");
+                        }
+                    } else if (isprint(ch)) {
+                        if (buf_len < (int)sizeof(buffer) - 1) {
+                            buffer[buf_len++] = ch;
+                            buffer[buf_len] = '\0';
+                            out_char(ch);
+                        }
+                    }
+                }
+            } else {
+                // evdev input_event
+                struct input_event ev;
+                while (read(fds[i].fd, &ev, sizeof(ev)) == sizeof(ev)) {
+                    if (ev.type == EV_KEY) {
+                        if (ev.code == KEY_LEFTSHIFT || ev.code == KEY_RIGHTSHIFT) {
+                            shift_active = (ev.value != 0);
+                            continue;
+                        }
+
+                        if (ev.value == 1 || ev.value == 2) { // Key down or repeat
+                            if (ev.code == KEY_POWER || ev.code == KEY_POWER2) {
+                                out_str("\n[POWER] Power button pressed. Powering off immediately...\n");
+                                sync();
+                                reboot(RB_POWER_OFF);
+                                exit(1);
+                            }
+
+                            if (ev.code == KEY_ENTER || ev.code == KEY_KPENTER) {
+                                if (strcasecmp(buffer, "yes") == 0) {
+                                    out_str("\nSelected: Discard hibernation snapshot and boot cleanly.\n");
+                                    if (tio_saved) tcsetattr(console_fd, TCSANOW, &old_tio);
+                                    return 0; // 0 = discard
+                                } else if (strcasecmp(buffer, "no") == 0) {
+                                    out_str("\nSelected: Power off machine.\n");
+                                    if (tio_saved) tcsetattr(console_fd, TCSANOW, &old_tio);
+                                    return 1; // 1 = poweroff
+                                } else if (strcasecmp(buffer, "force") == 0) {
+                                    out_str("\nSelected: Force resume anyway.\n");
+                                    if (tio_saved) tcsetattr(console_fd, TCSANOW, &old_tio);
+                                    return 2; // 2 = force resume
+                                } else {
+                                    out_str("\n[INVALID INPUT] Please type 'yes', 'no', or 'force' followed by Enter.\nConfirm action: > ");
+                                    buf_len = 0;
+                                    buffer[0] = '\0';
+                                }
+                            } else if (ev.code == KEY_BACKSPACE || ev.code == KEY_DELETE) {
+                                if (buf_len > 0) {
+                                    buf_len--;
+                                    buffer[buf_len] = '\0';
+                                    out_str("\b \b");
+                                }
+                            } else {
+                                char c = keycode_to_char(ev.code, shift_active);
+                                if (c != 0) {
+                                    if (buf_len < (int)sizeof(buffer) - 1) {
+                                        buffer[buf_len++] = c;
+                                        buffer[buf_len] = '\0';
+                                        out_char(c);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (tio_saved) tcsetattr(console_fd, TCSANOW, &old_tio);
+    return 1;
+}
+"""
+
+
+def get_default_kernel_cmdline():
+    params = []
+    default_grub = Path("/etc/default/grub")
+    if default_grub.is_file():
+        txt = default_grub.read_text()
+        m_linux = re.search(
+            r'^\s*GRUB_CMDLINE_LINUX=["\'](.*?)["\']', txt, re.MULTILINE
+        )
+        m_def = re.search(
+            r'^\s*GRUB_CMDLINE_LINUX_DEFAULT=["\'](.*?)["\']', txt, re.MULTILINE
+        )
+        if m_linux and m_linux.group(1).strip():
+            params.append(m_linux.group(1).strip())
+        if m_def and m_def.group(1).strip():
+            params.append(m_def.group(1).strip())
+
+    grub_d = Path("/etc/default/grub.d")
+    if grub_d.is_dir():
+        for cfg in sorted(grub_d.glob("*.cfg")):
+            txt = cfg.read_text()
+            m_linux = re.search(
+                r'^\s*GRUB_CMDLINE_LINUX=["\'](.*?)["\']', txt, re.MULTILINE
+            )
+            m_def = re.search(
+                r'^\s*GRUB_CMDLINE_LINUX_DEFAULT=["\'](.*?)["\']', txt, re.MULTILINE
+            )
+            if m_linux and m_linux.group(1).strip():
+                params.append(m_linux.group(1).strip())
+            if m_def and m_def.group(1).strip():
+                params.append(m_def.group(1).strip())
+
+    cmdline_file = Path("/proc/cmdline")
+    if cmdline_file.is_file():
+        cmd_tokens = cmdline_file.read_text().strip().split()
+        live_tokens = []
+        for token in cmd_tokens:
+            if (
+                token.startswith("BOOT_IMAGE=")
+                or token.startswith("root=")
+                or token.startswith("resume=")
+                or token.startswith("grub_id=")
+            ):
+                continue
+            if token in ["ro", "rw", "noresume", "splash"]:
+                continue
+            live_tokens.append(token)
+        if not params:
+            params = live_tokens
+        else:
+            existing = " ".join(params).split()
+            for lt in live_tokens:
+                if lt not in existing:
+                    params.append(lt)
+
+    cleaned_tokens = []
+    for t in " ".join(params).split():
+        if t.startswith("resume=") or t == "noresume":
+            continue
+        cleaned_tokens.append(t)
+
+    result = " ".join(cleaned_tokens).strip()
+    return result if result else "quiet"
 
 
 def run_command(cmd, check=True, capture_output=False, text=True):
@@ -207,6 +555,8 @@ def gather_machine_layout():
     kernel_dir = "" if is_separate_boot else "/boot"
     root_spec = f"UUID={root_uuid}" if root_uuid else root_dev
 
+    default_cmdline = get_default_kernel_cmdline()
+
     has_grub = Path("/etc/grub.d").is_dir() and shutil.which("update-grub") is not None
 
     has_systemd_boot = False
@@ -221,6 +571,7 @@ def gather_machine_layout():
         f"Resolved /boot partition at {boot_dev} (UUID: {boot_uuid or 'unknown'}, separate: {is_separate_boot})"
     )
     print(f"Resolved / (root) partition at {root_dev} (root_spec: {root_spec})")
+    print(f"Hardware Kernel Cmdline Parameters: '{default_cmdline}'")
     print(f"Detection Results -> GRUB: {has_grub} | systemd-boot: {has_systemd_boot}")
     return (
         boot_dev,
@@ -229,6 +580,7 @@ def gather_machine_layout():
         root_uuid,
         root_spec,
         kernel_dir,
+        default_cmdline,
         has_grub,
         has_systemd_boot,
         esp_dir,
@@ -283,13 +635,13 @@ def configure_initramfs_framework(installer_name=INSTALLER_NAME):
         f"FIRMWARE=all\n"
     )
 
-    # Install initramfs hook to bundle ethtool binary and libraries into initramfs
+    # Install initramfs hook to bundle ethtool binary and C interactive prompt into initramfs
     hooks_d = Path("/etc/initramfs-tools/hooks")
     hooks_d.mkdir(parents=True, exist_ok=True)
     tool_hook = hooks_d / "hibernation_safeguard_tools"
     tool_hook_content = f"""#!/bin/sh
 # Installed by {installer_name}
-# Bundles ethtool binary for permanent hardware MAC inspection into initramfs
+# Bundles ethtool binary and C interactive prompt into initramfs
 PREREQ=""
 prereqs() {{ echo "$PREREQ"; }}
 case $1 in prereqs) prereqs; exit 0;; esac
@@ -299,9 +651,37 @@ case $1 in prereqs) prereqs; exit 0;; esac
 if command -v ethtool >/dev/null 2>&1; then
     copy_exec $(command -v ethtool) /sbin
 fi
+
+if [ -f /usr/local/bin/hibernation-resume-prompt ]; then
+    copy_exec /usr/local/bin/hibernation-resume-prompt /bin
+fi
 """
     tool_hook.write_text(tool_hook_content)
     tool_hook.chmod(0o755)
+
+
+def write_c_prompt_daemon(installer_name=INSTALLER_NAME):
+    print("=== 2b. Compiling Native C Initramfs evdev Interactive Prompt ===")
+    src_dir = Path("/usr/local/src")
+    src_dir.mkdir(parents=True, exist_ok=True)
+    c_path = src_dir / "hibernation-resume-prompt.c"
+    c_path.write_text(C_PROMPT_SOURCE)
+
+    bin_path = Path("/usr/local/bin/hibernation-resume-prompt")
+    bin_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if shutil.which("gcc"):
+        try:
+            run_command(
+                ["gcc", "-O2", str(c_path), "-o", str(bin_path)],
+                check=True,
+            )
+            bin_path.chmod(0o755)
+            print(f"  [OK] Compiled {bin_path} successfully.")
+        except Exception as e:
+            sys.stderr.write(f"Warning: Failed to compile {c_path}: {e}\n")
+    else:
+        print("  [SKIP] gcc not found; will use shell fallback for interactive prompt.")
 
 
 def write_machine_id_helper(installer_name=INSTALLER_NAME):
@@ -643,7 +1023,9 @@ WantedBy=basic.target
         pass
 
 
-def write_grub_hooks(boot_uuid, root_spec, kernel_dir, installer_name=INSTALLER_NAME):
+def write_grub_hooks(
+    boot_uuid, root_spec, kernel_dir, default_cmdline, installer_name=INSTALLER_NAME
+):
     print("=== 5. Writing GRUB Hook (Non-Clobbering 40_custom Integration) ===")
     grub_d = Path("/etc/grub.d")
     grub_d.mkdir(parents=True, exist_ok=True)
@@ -812,14 +1194,14 @@ if [ -n "$target_boot_part" ]; then
             fi
             echo "============================================================"
             echo "Automatic countdown is DISABLED."
-            echo "Select an option from the menu (Default: Safe Power Off):"
-            echo "  1. Power Off Machine (Preserve Hibernation Session - Preselected)"
-            echo "  2. Discard Hibernation Image & Boot Cleanly"
-            echo "  3. Force Resume Anyway (Danger: Hardware Mismatch)"
+            echo "Available options in the menu (Default: Safe Power Off):"
+            echo "  * Power Off Machine (Preserve Hibernation Session - Preselected)"
+            echo "  * Discard Hibernation Image & Boot Cleanly"
+            echo "  * Force Resume Anyway (Danger: Hardware Mismatch)"
             echo "============================================================"
             echo ""
-            echo "Press any key to proceed to the menu (or waiting 30 seconds)..."
-            sleep --interruptible 30
+            echo "Press ESC or wait for timer to proceed to menu..."
+            sleep --verbose --interruptible 30
 
             # Dedicated Safeguard Menu Options in pure ASCII (Safe Power Off is Entry 1 and default)
             menuentry "[SAFEGUARD] 1. Power Off Machine (Preserve Hibernation Session - Default)" --id=safeguard_poweroff {
@@ -830,7 +1212,7 @@ if [ -n "$target_boot_part" ]; then
             menuentry "[SAFEGUARD] 2. Discard Hibernation Image & Boot Cleanly" --id=safeguard_clean {
                 echo "Loading kernel for clean boot (noresume)..."
                 search --no-floppy --fs-uuid --set=root __BOOT_UUID__
-                linux __KERNEL_DIR__/vmlinuz root=__ROOT_SPEC__ ro quiet noresume
+                linux __KERNEL_DIR__/vmlinuz root=__ROOT_SPEC__ ro __DEFAULT_CMDLINE__ noresume
                 initrd __KERNEL_DIR__/initrd.img
                 boot
             }
@@ -839,10 +1221,10 @@ if [ -n "$target_boot_part" ]; then
                 echo "Loading kernel for forced resume..."
                 search --no-floppy --fs-uuid --set=root __BOOT_UUID__
                 if [ -n "$SAVED_KERNEL_VERSION" ]; then
-                    linux __KERNEL_DIR__/vmlinuz-$SAVED_KERNEL_VERSION root=__ROOT_SPEC__ ro quiet
+                    linux __KERNEL_DIR__/vmlinuz-$SAVED_KERNEL_VERSION root=__ROOT_SPEC__ ro __DEFAULT_CMDLINE__
                     initrd __KERNEL_DIR__/initrd.img-$SAVED_KERNEL_VERSION
                 else
-                    linux __KERNEL_DIR__/vmlinuz root=__ROOT_SPEC__ ro quiet
+                    linux __KERNEL_DIR__/vmlinuz root=__ROOT_SPEC__ ro __DEFAULT_CMDLINE__
                     initrd __KERNEL_DIR__/initrd.img
                 fi
                 boot
@@ -865,6 +1247,7 @@ __SENTINEL_END__"""
         .replace("__BOOT_UUID__", boot_uuid)
         .replace("__ROOT_SPEC__", root_spec)
         .replace("__KERNEL_DIR__", kernel_dir)
+        .replace("__DEFAULT_CMDLINE__", default_cmdline)
     )
 
     standard_header = """#!/bin/sh
@@ -1049,13 +1432,13 @@ if [ -n "$SAVED_KERNEL" ] || [ -n "$SAVED_CPU" ] || [ -n "$SAVED_SYS_VENDOR" ] |
     if [ -n "$SAVED_SYS_VENDOR" ] && [ "$SAVED_SYS_VENDOR" != "$CURRENT_SYS_VENDOR" ]; then
         DMI_MISMATCH=true
         HAS_MISMATCH=true
-        DMI_MISMATCH_DETAILS="${DMI_MISMATCH_DETAILS}    System Vendor:  '$SAVED_SYS_VENDOR' -> '$CURRENT_SYS_VENDOR'\n"
+        DMI_MISMATCH_DETAILS="${DMI_MISMATCH_DETAILS}    System Vendor:   '$SAVED_SYS_VENDOR' -> '$CURRENT_SYS_VENDOR'\n"
     fi
 
     if [ -n "$SAVED_PRODUCT_NAME" ] && [ "$SAVED_PRODUCT_NAME" != "$CURRENT_PRODUCT_NAME" ]; then
         DMI_MISMATCH=true
         HAS_MISMATCH=true
-        DMI_MISMATCH_DETAILS="${DMI_MISMATCH_DETAILS}    Product Name:   '$SAVED_PRODUCT_NAME' -> '$CURRENT_PRODUCT_NAME'\n"
+        DMI_MISMATCH_DETAILS="${DMI_MISMATCH_DETAILS}    Product Name:    '$SAVED_PRODUCT_NAME' -> '$CURRENT_PRODUCT_NAME'\n"
     fi
 
     if [ -n "$SAVED_PRODUCT_VERSION" ] && [ "$SAVED_PRODUCT_VERSION" != "$CURRENT_PRODUCT_VERSION" ]; then
@@ -1067,25 +1450,25 @@ if [ -n "$SAVED_KERNEL" ] || [ -n "$SAVED_CPU" ] || [ -n "$SAVED_SYS_VENDOR" ] |
     if [ -n "$SAVED_BIOS_VENDOR" ] && [ "$SAVED_BIOS_VENDOR" != "$CURRENT_BIOS_VENDOR" ]; then
         DMI_MISMATCH=true
         HAS_MISMATCH=true
-        DMI_MISMATCH_DETAILS="${DMI_MISMATCH_DETAILS}    BIOS Vendor:    '$SAVED_BIOS_VENDOR' -> '$CURRENT_BIOS_VENDOR'\n"
+        DMI_MISMATCH_DETAILS="${DMI_MISMATCH_DETAILS}    BIOS Vendor:     '$SAVED_BIOS_VENDOR' -> '$CURRENT_BIOS_VENDOR'\n"
     fi
 
     if [ -n "$SAVED_BIOS_VERSION" ] && [ "$SAVED_BIOS_VERSION" != "$CURRENT_BIOS_VERSION" ]; then
         DMI_MISMATCH=true
         HAS_MISMATCH=true
-        DMI_MISMATCH_DETAILS="${DMI_MISMATCH_DETAILS}    BIOS Version:   '$SAVED_BIOS_VERSION' -> '$CURRENT_BIOS_VERSION'\n"
+        DMI_MISMATCH_DETAILS="${DMI_MISMATCH_DETAILS}    BIOS Version:    '$SAVED_BIOS_VERSION' -> '$CURRENT_BIOS_VERSION'\n"
     fi
 
     if [ -n "$SAVED_BOARD_VENDOR" ] && [ "$SAVED_BOARD_VENDOR" != "$CURRENT_BOARD_VENDOR" ]; then
         DMI_MISMATCH=true
         HAS_MISMATCH=true
-        DMI_MISMATCH_DETAILS="${DMI_MISMATCH_DETAILS}    Board Vendor:   '$SAVED_BOARD_VENDOR' -> '$CURRENT_BOARD_VENDOR'\n"
+        DMI_MISMATCH_DETAILS="${DMI_MISMATCH_DETAILS}    Board Vendor:    '$SAVED_BOARD_VENDOR' -> '$CURRENT_BOARD_VENDOR'\n"
     fi
 
     if [ -n "$SAVED_BOARD_NAME" ] && [ "$SAVED_BOARD_NAME" != "$CURRENT_BOARD_NAME" ]; then
         DMI_MISMATCH=true
         HAS_MISMATCH=true
-        DMI_MISMATCH_DETAILS="${DMI_MISMATCH_DETAILS}    Board Name:     '$SAVED_BOARD_NAME' -> '$CURRENT_BOARD_NAME'\n"
+        DMI_MISMATCH_DETAILS="${DMI_MISMATCH_DETAILS}    Board Name:      '$SAVED_BOARD_NAME' -> '$CURRENT_BOARD_NAME'\n"
     fi
 
     saved_kb=$(echo "$SAVED_RAM" | tr -dc '0-9')
@@ -1197,17 +1580,29 @@ if [ "$HAS_MISMATCH" = true ]; then
         plymouth unpause-progress 2>/dev/null || true
     fi
 
-    # Interactive prompt on text console (if plymouth was not used or did not resolve)
+    # Interactive prompt via compiled C evdev/console micro-daemon
+    if [ -z "$user_input" ] && [ -x /bin/hibernation-resume-prompt ]; then
+        /bin/hibernation-resume-prompt
+        prompt_rc=$?
+        case "$prompt_rc" in
+            0) user_input="yes" ;;
+            1) user_input="no" ;;
+            2) user_input="force" ;;
+            *) user_input="no" ;;
+        esac
+    fi
+
+    # Interactive prompt on text console fallback (if C daemon was not available)
     if [ -z "$user_input" ]; then
         echo "" > /dev/console 2>/dev/null || echo ""
         echo "==================================================" > /dev/console 2>/dev/null || echo "=================================================="
         echo "*** NOTICE: THIS IS NOT A DISK PASSWORD PROMPT ***" > /dev/console 2>/dev/null || echo "*** NOTICE: THIS IS NOT A DISK PASSWORD PROMPT ***"
-        echo "*** DO NOT TYPE YOUR DISK ENCRYPTION PASSWORD ***" > /dev/console 2>/dev/null || echo "*** DO NOT TYPE YOUR DISK ENCRYPTION PASSWORD ***"
+        echo "*** DO NOT TYPE YOUR DISK ENCRYPTION PASSWORD  ***" > /dev/console 2>/dev/null || echo "*** DO NOT TYPE YOUR DISK ENCRYPTION PASSWORD  ***"
         echo "==================================================" > /dev/console 2>/dev/null || echo "=================================================="
         echo "Options (must be fully typed out):" > /dev/console 2>/dev/null || echo "Options (must be fully typed out):"
-        echo "  yes   - Discard hibernation snapshot and boot cleanly" > /dev/console 2>/dev/null || echo "  yes   - Discard hibernation snapshot and boot cleanly"
-        echo "  no    - Power off immediately (preserves hibernated session)" > /dev/console 2>/dev/null || echo "  no    - Power off immediately (preserves hibernated session)"
-        echo "  force - Force resume attempt anyway (risk of kernel panic/corruption)" > /dev/console 2>/dev/null || echo "  force - Force resume attempt anyway (risk of kernel panic/corruption)"
+        echo "  * yes   - Discard hibernation snapshot and boot cleanly" > /dev/console 2>/dev/null || echo "  * yes   - Discard hibernation snapshot and boot cleanly"
+        echo "  * no    - Power off immediately (preserves hibernated session)" > /dev/console 2>/dev/null || echo "  * no    - Power off immediately (preserves hibernated session)"
+        echo "  * force - Force resume attempt anyway (risk of kernel panic/corruption)" > /dev/console 2>/dev/null || echo "  * force - Force resume attempt anyway (risk of kernel panic/corruption)"
         echo "--------------------------------------------------" > /dev/console 2>/dev/null || echo "--------------------------------------------------"
 
         CONSOLE_IN=""
@@ -1374,16 +1769,20 @@ def install(installer_name=INSTALLER_NAME):
         root_uuid,
         root_spec,
         kernel_dir,
+        default_cmdline,
         has_grub,
         has_systemd_boot,
         esp_dir,
     ) = gather_machine_layout()
+    write_c_prompt_daemon(installer_name)
     configure_initramfs_framework(installer_name)
     write_machine_id_helper(installer_name)
     write_systemd_sleep_hook(installer_name)
     write_boot_cleanup_service(installer_name)
     if has_grub:
-        write_grub_hooks(boot_uuid, root_spec, kernel_dir, installer_name)
+        write_grub_hooks(
+            boot_uuid, root_spec, kernel_dir, default_cmdline, installer_name
+        )
     write_initramfs_hook(boot_uuid, installer_name)
     compile_images(has_grub)
     print("=== SUCCESS ===")
@@ -1408,6 +1807,9 @@ def show_status(installer_name=INSTALLER_NAME):
 
     cleanup_svc = Path("/lib/systemd/system/hibernation-safeguard-cleanup.service")
     cleanup_svc_ok = cleanup_svc.is_file()
+
+    c_prompt_bin = Path("/usr/local/bin/hibernation-resume-prompt")
+    c_prompt_ok = c_prompt_bin.is_file() and os.access(c_prompt_bin, os.X_OK)
 
     init_hook = Path("/etc/initramfs-tools/scripts/local-top/hibernation_resume_check")
     init_hook_ok = init_hook.is_file() and os.access(init_hook, os.X_OK)
@@ -1445,6 +1847,9 @@ def show_status(installer_name=INSTALLER_NAME):
     )
     print(
         f"  - Boot cleanup service (hibernation-safeguard-cleanup.service)     : {badge(cleanup_svc_ok)}"
+    )
+    print(
+        f"  - C evdev prompt binary (/usr/local/bin/hibernation-resume-prompt) : {badge(c_prompt_ok)}"
     )
     print(
         f"  - Initramfs check hook (/etc/initramfs-tools/scripts/local-top/..): {badge(init_hook_ok)}"
@@ -1593,6 +1998,7 @@ def show_status(installer_name=INSTALLER_NAME):
             helper_ok,
             sleep_hook_ok,
             cleanup_svc_ok,
+            c_prompt_ok,
             init_hook_ok,
             tool_hook_ok,
             modules_ok,
@@ -1605,6 +2011,7 @@ def show_status(installer_name=INSTALLER_NAME):
             helper_ok,
             sleep_hook_ok,
             cleanup_svc_ok,
+            c_prompt_ok,
             init_hook_ok,
             tool_hook_ok,
             modules_ok,
