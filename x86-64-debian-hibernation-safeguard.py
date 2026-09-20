@@ -196,57 +196,16 @@ C_PROMPT_SOURCE = r"""
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/reboot.h>
+#include <sys/ioctl.h>
 #include <linux/input.h>
-#include <termios.h>
 
-#define MAX_FDS 64
+#define MAX_EV_FDS 32
+#define PROMPT_PREFIX "Lose unmatched hibernation? Yes=new/No=off/Force=resume: > "
 
-struct ev_dev {
-    int fd;
-    char path[64];
-};
-
-static struct ev_dev ev_devs[MAX_FDS];
-static int num_ev_devs = 0;
-
-static int out_fds[8];
-static int num_out_fds = 0;
 static int plymouth_active = 0;
-
-static const char *PROMPT_PREFIX = "Lose unmatched hibernation? Yes=new/No=off/Force=resume: > ";
-
-static void add_out_fd(int fd) {
-    if (fd < 0) return;
-    for (int i = 0; i < num_out_fds; i++) {
-        if (out_fds[i] == fd) return;
-    }
-    if (num_out_fds < 8) {
-        out_fds[num_out_fds++] = fd;
-    }
-}
-
-static void out_str(const char *s) {
-    size_t len = strlen(s);
-    for (int i = 0; i < num_out_fds; i++) {
-        if (out_fds[i] >= 0) {
-            ssize_t w = write(out_fds[i], s, len);
-            (void)w;
-        }
-    }
-}
-
-static void out_char(char c) {
-    char b[2] = { c, '\0' };
-    out_str(b);
-}
-
-static void set_nonblocking(int fd) {
-    if (fd < 0) return;
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) {
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    }
-}
+static char input_buf[64];
+static int buf_len = 0;
+static int shift_down = 0;
 
 static int check_plymouth(void) {
     if (access("/bin/plymouth", X_OK) == 0 || access("/usr/bin/plymouth", X_OK) == 0) {
@@ -257,48 +216,52 @@ static int check_plymouth(void) {
     return 0;
 }
 
-static void update_plymouth_msg(const char *msg) {
+static void update_display(void) {
+    char full_prompt[160];
+    snprintf(full_prompt, sizeof(full_prompt), "%s%s", PROMPT_PREFIX, input_buf);
+
     if (plymouth_active) {
         char cmd[256];
-        snprintf(cmd, sizeof(cmd), "plymouth message --text=\"%s\" 2>/dev/null", msg);
+        snprintf(cmd, sizeof(cmd), "plymouth message --text=\"%s\" 2>/dev/null", full_prompt);
         int r = system(cmd);
         (void)r;
     }
-}
 
-static void update_plymouth_prompt(const char *buf) {
-    if (plymouth_active) {
-        char line[160];
-        snprintf(line, sizeof(line), "%s%s", PROMPT_PREFIX, buf);
-        update_plymouth_msg(line);
+    // Also write to /dev/console and /dev/tty0 for direct text console visibility
+    int cfd = open("/dev/console", O_WRONLY | O_NOCTTY);
+    if (cfd >= 0) {
+        char line[200];
+        snprintf(line, sizeof(line), "\r\033[K%s", full_prompt);
+        ssize_t w = write(cfd, line, strlen(line));
+        (void)w;
+        close(cfd);
     }
 }
 
-static void scan_and_add_evdevs(void) {
+static int scan_inputs(struct pollfd *fds, int max_fds) {
+    for (int i = 0; i < max_fds; i++) {
+        if (fds[i].fd >= 0) {
+            close(fds[i].fd);
+            fds[i].fd = -1;
+        }
+    }
     glob_t g;
+    int num_fds = 0;
     if (glob("/dev/input/event*", 0, NULL, &g) == 0) {
-        for (size_t i = 0; i < g.gl_pathc; i++) {
-            int already_open = 0;
-            for (int j = 0; j < num_ev_devs; j++) {
-                if (strcmp(ev_devs[j].path, g.gl_pathv[i]) == 0) {
-                    already_open = 1;
-                    break;
-                }
-            }
-            if (!already_open && num_ev_devs < MAX_FDS - 8) {
-                int fd = open(g.gl_pathv[i], O_RDONLY | O_NONBLOCK);
-                if (fd >= 0) {
-                    ev_devs[num_ev_devs].fd = fd;
-                    strncpy(ev_devs[num_ev_devs].path, g.gl_pathv[i], sizeof(ev_devs[num_ev_devs].path) - 1);
-                    num_ev_devs++;
-                }
+        for (size_t i = 0; i < g.gl_pathc && num_fds < max_fds; i++) {
+            int fd = open(g.gl_pathv[i], O_RDONLY | O_NONBLOCK);
+            if (fd >= 0) {
+                fds[num_fds].fd = fd;
+                fds[num_fds].events = POLLIN;
+                num_fds++;
             }
         }
         globfree(&g);
     }
+    return num_fds;
 }
 
-static char keycode_to_char(int code, int shift) {
+static char keycode_to_ascii(int code, int shift) {
     switch (code) {
         case KEY_A: return shift ? 'A' : 'a';
         case KEY_B: return shift ? 'B' : 'b';
@@ -354,222 +317,115 @@ static char keycode_to_char(int code, int shift) {
 int main(int argc, char **argv) {
     plymouth_active = check_plymouth();
 
-    int cfd = open("/dev/console", O_RDWR | O_NOCTTY);
-    if (cfd >= 0) add_out_fd(cfd);
-    int t0fd = open("/dev/tty0", O_RDWR | O_NOCTTY);
-    if (t0fd >= 0) add_out_fd(t0fd);
-    int t1fd = open("/dev/tty1", O_RDWR | O_NOCTTY);
-    if (t1fd >= 0) add_out_fd(t1fd);
-    add_out_fd(STDOUT_FILENO);
+    struct pollfd fds[MAX_EV_FDS];
+    for (int i = 0; i < MAX_EV_FDS; i++) fds[i].fd = -1;
 
-    struct termios old_tio[8];
-    int tio_saved[8] = {0};
-    for (int i = 0; i < num_out_fds; i++) {
-        if (out_fds[i] >= 0 && isatty(out_fds[i])) {
-            if (tcgetattr(out_fds[i], &old_tio[i]) == 0) {
-                struct termios raw = old_tio[i];
-                raw.c_lflag &= (~ICANON & ~ECHO);
-                raw.c_cc[VMIN] = 0;
-                raw.c_cc[VTIME] = 0;
-                tcsetattr(out_fds[i], TCSANOW, &raw);
-                tio_saved[i] = 1;
-            }
-        }
-    }
+    int num_fds = scan_inputs(fds, MAX_EV_FDS);
 
-    if (!plymouth_active) {
-        out_str("\n");
-        out_str("==================================================\n");
-        out_str("*** NOTICE: THIS IS NOT A DISK PASSWORD PROMPT ***\n");
-        out_str("*** DO NOT TYPE YOUR DISK ENCRYPTION PASSWORD  ***\n");
-        out_str("==================================================\n");
-        out_str("Options (type full word + Enter):\n");
-        out_str("  * yes   - Discard hibernation snapshot and boot cleanly\n");
-        out_str("  * no    - Power off immediately (preserves session)\n");
-        out_str("  * force - Force resume attempt anyway (risk of panic)\n");
-        out_str("--------------------------------------------------\n");
-        out_str(PROMPT_PREFIX);
-    } else {
-        update_plymouth_prompt("");
-    }
-
-    scan_and_add_evdevs();
-
-    char buffer[64];
-    int buf_len = 0;
-    memset(buffer, 0, sizeof(buffer));
-
-    int shift_active = 0;
+    // Initial prompt display
+    memset(input_buf, 0, sizeof(input_buf));
+    buf_len = 0;
+    update_display();
 
     while (1) {
-        struct pollfd p_fds[MAX_FDS];
-        int fd_map_type[MAX_FDS]; // 0 = tty/stdin, 1 = evdev
-        int fd_map_idx[MAX_FDS];
-        int num_p_fds = 0;
-
-        // Add STDIN
-        set_nonblocking(STDIN_FILENO);
-        p_fds[num_p_fds].fd = STDIN_FILENO;
-        p_fds[num_p_fds].events = POLLIN;
-        fd_map_type[num_p_fds] = 0;
-        fd_map_idx[num_p_fds] = -1;
-        num_p_fds++;
-
-        // Add ttys
-        for (int i = 0; i < num_out_fds; i++) {
-            if (out_fds[i] >= 0 && out_fds[i] != STDOUT_FILENO && out_fds[i] != STDIN_FILENO) {
-                set_nonblocking(out_fds[i]);
-                p_fds[num_p_fds].fd = out_fds[i];
-                p_fds[num_p_fds].events = POLLIN;
-                fd_map_type[num_p_fds] = 0;
-                fd_map_idx[num_p_fds] = i;
-                num_p_fds++;
-            }
+        if (num_fds == 0) {
+            usleep(250000);
+            num_fds = scan_inputs(fds, MAX_EV_FDS);
+            continue;
         }
 
-        // Add evdevs
-        for (int i = 0; i < num_ev_devs && num_p_fds < MAX_FDS; i++) {
-            if (ev_devs[i].fd >= 0) {
-                p_fds[num_p_fds].fd = ev_devs[i].fd;
-                p_fds[num_p_fds].events = POLLIN;
-                fd_map_type[num_p_fds] = 1;
-                fd_map_idx[num_p_fds] = i;
-                num_p_fds++;
-            }
-        }
+        int ret = poll(fds, num_fds, 500);
 
-        int ret = poll(p_fds, num_p_fds, 250);
         if (ret < 0) {
             if (errno == EINTR) continue;
             break;
         }
 
-        // Re-scan for new input devices periodically
-        scan_and_add_evdevs();
+        // Periodically verify plymouth state
+        plymouth_active = check_plymouth();
 
         if (ret == 0) {
+            // Periodic rescan for newly attached USB keyboards
+            int new_fds = scan_inputs(fds, MAX_EV_FDS);
+            num_fds = new_fds;
             continue;
         }
 
-        for (int i = 0; i < num_p_fds; i++) {
-            if (!(p_fds[i].revents & POLLIN)) continue;
+        struct input_event ev;
+        for (int i = 0; i < num_fds; i++) {
+            if (fds[i].revents & POLLIN) {
+                while (read(fds[i].fd, &ev, sizeof(ev)) == sizeof(ev)) {
+                    if (ev.type != EV_KEY) continue;
 
-            if (fd_map_type[i] == 0) {
-                char ch;
-                while (read(p_fds[i].fd, &ch, 1) == 1) {
-                    if (ch == '\r' || ch == '\n') {
-                        if (strcasecmp(buffer, "yes") == 0) {
-                            out_str("\nSelected: Discard hibernation snapshot and boot cleanly.\n");
-                            update_plymouth_msg("[CONFIRMED] Discarding hibernation image for clean boot.");
-                            if (plymouth_active) system("plymouth unpause-progress 2>/dev/null || true");
-                            for (int k = 0; k < num_out_fds; k++) {
-                                if (tio_saved[k]) tcsetattr(out_fds[k], TCSANOW, &old_tio[k]);
-                            }
-                            return 0; // 0 = yes / discard
-                        } else if (strcasecmp(buffer, "no") == 0) {
-                            out_str("\nSelected: Power off machine.\n");
-                            update_plymouth_msg("[CONFIRMED] Powering off machine...");
-                            for (int k = 0; k < num_out_fds; k++) {
-                                if (tio_saved[k]) tcsetattr(out_fds[k], TCSANOW, &old_tio[k]);
-                            }
-                            return 1; // 1 = no / poweroff
-                        } else if (strcasecmp(buffer, "force") == 0) {
-                            out_str("\nSelected: Force resume anyway.\n");
-                            update_plymouth_msg("[CONFIRMED] Forcing hibernation resume...");
-                            if (plymouth_active) system("plymouth unpause-progress 2>/dev/null || true");
-                            for (int k = 0; k < num_out_fds; k++) {
-                                if (tio_saved[k]) tcsetattr(out_fds[k], TCSANOW, &old_tio[k]);
-                            }
-                            return 2; // 2 = force resume
-                        } else {
-                            out_str("\n[INVALID INPUT] Please type 'yes', 'no', or 'force' followed by Enter.\n");
-                            out_str(PROMPT_PREFIX);
-                            buf_len = 0;
-                            buffer[0] = '\0';
-                            update_plymouth_prompt(buffer);
-                        }
-                    } else if (ch == 127 || ch == '\b') {
-                        if (buf_len > 0) {
-                            buf_len--;
-                            buffer[buf_len] = '\0';
-                            out_str("\b \b");
-                            update_plymouth_prompt(buffer);
-                        }
-                    } else if (isprint(ch)) {
-                        if (buf_len < (int)sizeof(buffer) - 1) {
-                            buffer[buf_len++] = ch;
-                            buffer[buf_len] = '\0';
-                            out_char(ch);
-                            update_plymouth_prompt(buffer);
-                        }
+                    // Track Shift key
+                    if (ev.code == KEY_LEFTSHIFT || ev.code == KEY_RIGHTSHIFT) {
+                        shift_down = (ev.value != 0);
+                        continue;
                     }
-                }
-            } else {
-                struct input_event ev;
-                while (read(p_fds[i].fd, &ev, sizeof(ev)) == sizeof(ev)) {
-                    if (ev.type == EV_KEY) {
-                        if (ev.code == KEY_LEFTSHIFT || ev.code == KEY_RIGHTSHIFT) {
-                            shift_active = (ev.value != 0);
-                            continue;
+
+                    // Key down or repeat
+                    if (ev.value == 1 || ev.value == 2) {
+                        // Power button press -> Safe power off
+                        if (ev.code == KEY_POWER || ev.code == KEY_POWER2) {
+                            if (plymouth_active) system("plymouth message --text=\"[POWER] Powering off machine...\" 2>/dev/null");
+                            int cfd = open("/dev/console", O_WRONLY | O_NOCTTY);
+                            if (cfd >= 0) {
+                                ssize_t w = write(cfd, "\nPower button pressed. Powering off...\n", 39);
+                                (void)w;
+                                close(cfd);
+                            }
+                            sync();
+                            reboot(RB_POWER_OFF);
+                            return 1;
                         }
 
-                        if (ev.value == 1 || ev.value == 2) {
-                            if (ev.code == KEY_POWER || ev.code == KEY_POWER2) {
-                                out_str("\n[POWER] Power button pressed. Powering off immediately...\n");
-                                update_plymouth_msg("[POWER] Power button pressed. Powering off...");
-                                sync();
-                                reboot(RB_POWER_OFF);
-                                exit(1);
-                            }
-
-                            if (ev.code == KEY_ENTER || ev.code == KEY_KPENTER) {
-                                if (strcasecmp(buffer, "yes") == 0) {
-                                    out_str("\nSelected: Discard hibernation snapshot and boot cleanly.\n");
-                                    update_plymouth_msg("[CONFIRMED] Discarding hibernation image for clean boot.");
-                                    if (plymouth_active) system("plymouth unpause-progress 2>/dev/null || true");
-                                    for (int k = 0; k < num_out_fds; k++) {
-                                        if (tio_saved[k]) tcsetattr(out_fds[k], TCSANOW, &old_tio[k]);
-                                    }
-                                    return 0; // 0 = discard / clean boot
-                                } else if (strcasecmp(buffer, "no") == 0) {
-                                    out_str("\nSelected: Power off machine.\n");
-                                    update_plymouth_msg("[CONFIRMED] Powering off machine...");
-                                    for (int k = 0; k < num_out_fds; k++) {
-                                        if (tio_saved[k]) tcsetattr(out_fds[k], TCSANOW, &old_tio[k]);
-                                    }
-                                    return 1; // 1 = power off
-                                } else if (strcasecmp(buffer, "force") == 0) {
-                                    out_str("\nSelected: Force resume anyway.\n");
-                                    update_plymouth_msg("[CONFIRMED] Forcing hibernation resume...");
-                                    if (plymouth_active) system("plymouth unpause-progress 2>/dev/null || true");
-                                    for (int k = 0; k < num_out_fds; k++) {
-                                        if (tio_saved[k]) tcsetattr(out_fds[k], TCSANOW, &old_tio[k]);
-                                    }
-                                    return 2; // 2 = force resume
-                                } else {
-                                    out_str("\n[INVALID INPUT] Please type 'yes', 'no', or 'force' followed by Enter.\n");
-                                    out_str(PROMPT_PREFIX);
-                                    buf_len = 0;
-                                    buffer[0] = '\0';
-                                    update_plymouth_prompt(buffer);
+                        // Enter key -> Submit answer
+                        if (ev.code == KEY_ENTER || ev.code == KEY_KPENTER) {
+                            if (strcasecmp(input_buf, "yes") == 0) {
+                                if (plymouth_active) system("plymouth message --text=\"[CONFIRMED] Clean boot (discard snapshot)...\" 2>/dev/null");
+                                int cfd = open("/dev/console", O_WRONLY | O_NOCTTY);
+                                if (cfd >= 0) {
+                                    ssize_t w = write(cfd, "\nConfirmed: Discard snapshot and clean boot.\n", 45);
+                                    (void)w;
+                                    close(cfd);
                                 }
-                            } else if (ev.code == KEY_BACKSPACE || ev.code == KEY_DELETE) {
-                                if (buf_len > 0) {
-                                    buf_len--;
-                                    buffer[buf_len] = '\0';
-                                    out_str("\b \b");
-                                    update_plymouth_prompt(buffer);
+                                return 0; // 0 = yes (discard / clean boot)
+                            } else if (strcasecmp(input_buf, "no") == 0) {
+                                if (plymouth_active) system("plymouth message --text=\"[CONFIRMED] Powering off machine...\" 2>/dev/null");
+                                int cfd = open("/dev/console", O_WRONLY | O_NOCTTY);
+                                if (cfd >= 0) {
+                                    ssize_t w = write(cfd, "\nConfirmed: Power off machine.\n", 31);
+                                    (void)w;
+                                    close(cfd);
                                 }
+                                return 1; // 1 = no (power off)
+                            } else if (strcasecmp(input_buf, "force") == 0) {
+                                if (plymouth_active) system("plymouth message --text=\"[CONFIRMED] Forcing resume anyway...\" 2>/dev/null");
+                                int cfd = open("/dev/console", O_WRONLY | O_NOCTTY);
+                                if (cfd >= 0) {
+                                    ssize_t w = write(cfd, "\nConfirmed: Forcing resume anyway.\n", 35);
+                                    (void)w;
+                                    close(cfd);
+                                }
+                                return 2; // 2 = force resume
                             } else {
-                                char c = keycode_to_char(ev.code, shift_active);
-                                if (c != 0) {
-                                    if (buf_len < (int)sizeof(buffer) - 1) {
-                                        buffer[buf_len++] = c;
-                                        buffer[buf_len] = '\0';
-                                        out_char(c);
-                                        update_plymouth_prompt(buffer);
-                                    }
-                                }
+                                // Invalid input: reset buffer and re-prompt
+                                buf_len = 0;
+                                input_buf[0] = '\0';
+                                update_display();
+                            }
+                        } else if (ev.code == KEY_BACKSPACE || ev.code == KEY_DELETE) {
+                            if (buf_len > 0) {
+                                buf_len--;
+                                input_buf[buf_len] = '\0';
+                                update_display();
+                            }
+                        } else {
+                            char c = keycode_to_ascii(ev.code, shift_down);
+                            if (c != 0 && buf_len < (int)sizeof(input_buf) - 1) {
+                                input_buf[buf_len++] = c;
+                                input_buf[buf_len] = '\0';
+                                update_display();
                             }
                         }
                     }
@@ -578,8 +434,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    for (int k = 0; k < num_out_fds; k++) {
-        if (tio_saved[k]) tcsetattr(out_fds[k], TCSANOW, &old_tio[k]);
+    for (int i = 0; i < num_fds; i++) {
+        if (fds[i].fd >= 0) close(fds[i].fd);
     }
     return 1;
 }
@@ -2026,60 +1882,11 @@ if [ -n "$SAVED_KERNEL" ] || [ -n "$SAVED_CPU" ] || [ -n "$SAVED_SYS_VENDOR" ] |
 fi
 
 if [ "$HAS_MISMATCH" = true ]; then
-    DETAILS=""
-    if [ "$KERNEL_MISMATCH" = true ]; then
-        DETAILS="${DETAILS}  [Kernel Version Mismatch]\n    Saved:   $SAVED_KERNEL\n    Current: $CURRENT_KERNEL\n"
-    fi
-    if [ "$DMI_MISMATCH" = true ]; then
-        DETAILS="${DETAILS}  [DMI / SMBIOS Mismatch]\n${DMI_MISMATCH_DETAILS}"
-    fi
-    if [ "$CPU_MISMATCH" = true ]; then
-        DETAILS="${DETAILS}  [CPU Model Mismatch]\n    Saved:   $SAVED_CPU\n    Current: $CURRENT_CPU\n"
-    fi
-    if [ "$RAM_MISMATCH" = true ]; then
-        DETAILS="${DETAILS}  [RAM Size Mismatch]\n    Saved:   $SAVED_RAM\n    Current: $CURRENT_RAM\n"
-    fi
-    if [ "$MAC_MISMATCH" = true ]; then
-        DETAILS="${DETAILS}  [MAC Address Mismatch (interface: $SAVED_MAC_IFACE)]\n    Saved:   $SAVED_MAC\n    Current: $CURRENT_MAC\n"
-    fi
-
-    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    echo "HIBERNATION RESUME SAFEGUARD: MISMATCH DETECTED!"
-    printf "%b" "$DETAILS"
-    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-
-    # If Plymouth is active, display the warning and options list directly on Plymouth splash
-    if [ -x /bin/plymouth ] && plymouth --ping 2>/dev/null; then
-        plymouth pause-progress 2>/dev/null || true
-        plymouth message --text="=================================================="
-        plymouth message --text="*** WARNING: ENVIRONMENT MISMATCH DETECTED ***"
-        plymouth message --text="*** THIS IS NOT A DISK PASSPHRASE PROMPT ***"
-        plymouth message --text="*** DO NOT ENTER YOUR LUKS / DISK PASSWORD ***"
-        plymouth message --text="=================================================="
-        if [ "$KERNEL_MISMATCH" = true ]; then
-            plymouth message --text="Kernel update detected ($SAVED_KERNEL -> $CURRENT_KERNEL)"
-        else
-            plymouth message --text="Hardware / DMI environment change detected since hibernation."
-        fi
-        plymouth message --text="Options (type full word + Enter):"
-        plymouth message --text="  * yes   - Discard hibernation snapshot and boot cleanly"
-        plymouth message --text="  * no    - Power off immediately (preserves session)"
-        plymouth message --text="  * force - Force resume attempt anyway (risk of panic)"
-        plymouth message --text="--------------------------------------------------"
-        plymouth message --text="Confirm action: > "
-    fi
-
-    # Ensure input kernel drivers are loaded and settled
-    modprobe evdev 2>/dev/null || true
-    modprobe atkbd 2>/dev/null || true
-    modprobe i8042 2>/dev/null || true
-    modprobe hid_generic 2>/dev/null || true
-    modprobe usbhid 2>/dev/null || true
-    command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=5 2>/dev/null || true
+    echo "[SAFEGUARD] Hibernation hardware/kernel mismatch detected since hibernation."
 
     user_input=""
 
-    # Interactive prompt via compiled native C evdev/console micro-daemon (updates Plymouth line dynamically)
+    # Interactive prompt via compiled native C micro-daemon
     PROMPT_BIN=""
     if [ -x /bin/hibernation-resume-prompt ]; then
         PROMPT_BIN="/bin/hibernation-resume-prompt"
@@ -2097,43 +1904,34 @@ if [ "$HAS_MISMATCH" = true ]; then
             1) user_input="no" ;;
             2) user_input="force" ;;
             *)
-                echo "[WARNING] C prompt binary exited with status $prompt_rc (abnormal termination or crash)." > /dev/console 2>/dev/null || echo "[WARNING] C prompt binary exited with status $prompt_rc."
+                echo "[WARNING] C prompt binary exited with status $prompt_rc." > /dev/console 2>/dev/null || true
                 user_input=""
                 ;;
         esac
-    else
-        echo "[WARNING] C prompt binary not found or not executable in initramfs." > /dev/console 2>/dev/null || echo "[WARNING] C prompt binary not found or not executable."
     fi
 
-    # Fallback to shell-based interactive prompt if C binary was missing, non-executable, or exited abnormally/crashed
+    # Fallback to shell-based interactive prompt if C binary was missing, non-executable, or exited abnormally
     if [ -z "$user_input" ]; then
         PROMPT_STR="Lose unmatched hibernation? Yes=new/No=off/Force=resume: > "
 
-        use_plymouth=false
-        if command -v plymouth >/dev/null 2>&1 && plymouth --ping 2>/dev/null; then
-            use_plymouth=true
-        fi
-
-        CONSOLE_IN=""
-        CONSOLE_OUT=""
-        if [ -c /dev/console ] && [ -r /dev/console ]; then
-            CONSOLE_IN="/dev/console"
-            CONSOLE_OUT="/dev/console"
-        elif [ -c /dev/tty0 ] && [ -r /dev/tty0 ]; then
-            CONSOLE_IN="/dev/tty0"
-            CONSOLE_OUT="/dev/tty0"
-        fi
-
         while [ -z "$user_input" ]; do
             raw_ans=""
-            if [ "$use_plymouth" = true ]; then
+            if command -v plymouth >/dev/null 2>&1 && plymouth --ping 2>/dev/null; then
                 raw_ans=$(plymouth ask-question --prompt="$PROMPT_STR" 2>/dev/null)
                 if ! plymouth --ping 2>/dev/null; then
-                    use_plymouth=false
+                    plymouth quit 2>/dev/null || true
                 fi
-            fi
+            else
+                CONSOLE_OUT=""
+                CONSOLE_IN=""
+                if [ -c /dev/console ] && [ -w /dev/console ] && [ -r /dev/console ]; then
+                    CONSOLE_OUT="/dev/console"
+                    CONSOLE_IN="/dev/console"
+                elif [ -c /dev/tty0 ] && [ -w /dev/tty0 ] && [ -r /dev/tty0 ]; then
+                    CONSOLE_OUT="/dev/tty0"
+                    CONSOLE_IN="/dev/tty0"
+                fi
 
-            if [ "$use_plymouth" != true ]; then
                 if [ -n "$CONSOLE_OUT" ]; then
                     printf "%s" "$PROMPT_STR" > "$CONSOLE_OUT" 2>/dev/null || printf "%s" "$PROMPT_STR"
                 else
@@ -2141,9 +1939,9 @@ if [ "$HAS_MISMATCH" = true ]; then
                 fi
 
                 if [ -n "$CONSOLE_IN" ]; then
-                    read -r raw_ans < "$CONSOLE_IN" 2>/dev/null || { sleep 1; read -r raw_ans 2>/dev/null || true; }
+                    read -r raw_ans < "$CONSOLE_IN" 2>/dev/null || read -r raw_ans
                 else
-                    read -r raw_ans || { sleep 1; true; }
+                    read -r raw_ans
                 fi
             fi
 
@@ -2159,13 +1957,12 @@ if [ "$HAS_MISMATCH" = true ]; then
                     user_input="force"
                     ;;
                 *)
-                    # Invalid answer: re-prompt until it is an acceptable answer
+                    # Invalid answer: re-prompt until an acceptable answer is provided
                     ;;
             esac
         done
     fi
-
-    if [ "$user_input" = "no" ]; then
+if [ "$user_input" = "no" ]; then
         cleanup_boot_mnt
         echo "Powering off machine..."
         poweroff -f
