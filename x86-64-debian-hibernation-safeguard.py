@@ -1447,6 +1447,93 @@ def write_grub_hooks(
         f"### END HIBERNATION HARDWARE SAFEGUARD (installed by {installer_name}) ###"
     )
 
+    # Discover installed versioned kernels in /boot to ensure versioned GRUB references
+    installed_versions = []
+    curr_k = os.uname().release
+    if curr_k:
+        installed_versions.append(curr_k)
+
+    boot_dir = Path("/boot")
+    if boot_dir.is_dir():
+        for kfile in sorted(boot_dir.glob("vmlinuz-*"), reverse=True):
+            if kfile.is_file() and not kfile.is_symlink():
+                v = kfile.name[len("vmlinuz-") :].strip()
+                if v and v not in installed_versions:
+                    installed_versions.append(v)
+
+    # Order oldest to newest so newest installed kernel wins if saved kernel is absent
+    sorted_versions = list(reversed(installed_versions))
+
+    def generate_kernel_selector(extra_arg):
+        lines = []
+        lines.append('                chosen_kernel=""')
+        lines.append('                chosen_initrd=""')
+        lines.append("")
+        lines.append(
+            "                # 1. Unversioned fallback (lowest priority, only if file exists)"
+        )
+        lines.append("                if [ -f /vmlinuz ]; then")
+        lines.append('                    chosen_kernel="/vmlinuz"')
+        lines.append('                    chosen_initrd="/initrd.img"')
+        lines.append("                fi")
+        lines.append("                if [ -f /boot/vmlinuz ]; then")
+        lines.append('                    chosen_kernel="/boot/vmlinuz"')
+        lines.append('                    chosen_initrd="/boot/initrd.img"')
+        lines.append("                fi")
+        lines.append("")
+        lines.append(
+            "                # 2. Installed versioned kernels (ordered oldest to newest so newest wins)"
+        )
+        for v in sorted_versions:
+            lines.append(f"                if [ -f /vmlinuz-{v} ]; then")
+            lines.append(f'                    chosen_kernel="/vmlinuz-{v}"')
+            lines.append(f'                    chosen_initrd="/initrd.img-{v}"')
+            lines.append("                fi")
+            lines.append(f"                if [ -f /boot/vmlinuz-{v} ]; then")
+            lines.append(f'                    chosen_kernel="/boot/vmlinuz-{v}"')
+            lines.append(f'                    chosen_initrd="/boot/initrd.img-{v}"')
+            lines.append("                fi")
+        lines.append("")
+        lines.append(
+            "                # 3. Saved hibernation kernel from previous session (highest priority)"
+        )
+        lines.append('                if [ -n "$SAVED_KERNEL_VERSION" ]; then')
+        lines.append(
+            "                    if [ -f /vmlinuz-$SAVED_KERNEL_VERSION ]; then"
+        )
+        lines.append(
+            '                        chosen_kernel="/vmlinuz-$SAVED_KERNEL_VERSION"'
+        )
+        lines.append(
+            '                        chosen_initrd="/initrd.img-$SAVED_KERNEL_VERSION"'
+        )
+        lines.append("                    fi")
+        lines.append(
+            "                    if [ -f /boot/vmlinuz-$SAVED_KERNEL_VERSION ]; then"
+        )
+        lines.append(
+            '                        chosen_kernel="/boot/vmlinuz-$SAVED_KERNEL_VERSION"'
+        )
+        lines.append(
+            '                        chosen_initrd="/boot/initrd.img-$SAVED_KERNEL_VERSION"'
+        )
+        lines.append("                    fi")
+        lines.append("                fi")
+        lines.append("")
+        lines.append('                if [ -n "$chosen_kernel" ]; then')
+        lines.append(
+            f"                    linux $chosen_kernel root={root_spec} ro {default_cmdline} {extra_arg}"
+        )
+        lines.append('                    if [ -n "$chosen_initrd" ]; then')
+        lines.append("                        initrd $chosen_initrd")
+        lines.append("                    fi")
+        lines.append("                    boot")
+        lines.append("                fi")
+        return "\n".join(lines)
+
+    clean_selector = generate_kernel_selector("noresume")
+    force_selector = generate_kernel_selector(resume_param)
+
     template_block = r"""__SENTINEL_START__
 insmod smbios
 insmod echo
@@ -1617,69 +1704,13 @@ if [ -n "$target_boot_part" ]; then
             menuentry "[SAFEGUARD] 2. Discard Hibernation Image & Boot Cleanly" --id=safeguard_clean {
                 echo "Loading kernel for clean boot (noresume)..."
                 search --no-floppy --fs-uuid --set=root __BOOT_UUID__
-                chosen_kernel=""
-                chosen_initrd=""
-                if [ -n "$SAVED_KERNEL_VERSION" ] && [ -f __KERNEL_DIR__/vmlinuz-$SAVED_KERNEL_VERSION ]; then
-                    chosen_kernel="__KERNEL_DIR__/vmlinuz-$SAVED_KERNEL_VERSION"
-                    chosen_initrd="__KERNEL_DIR__/initrd.img-$SAVED_KERNEL_VERSION"
-                elif [ -n "$SAVED_KERNEL_VERSION" ] && [ -f /boot/vmlinuz-$SAVED_KERNEL_VERSION ]; then
-                    chosen_kernel="/boot/vmlinuz-$SAVED_KERNEL_VERSION"
-                    chosen_initrd="/boot/initrd.img-$SAVED_KERNEL_VERSION"
-                elif [ -n "$SAVED_KERNEL_VERSION" ] && [ -f /vmlinuz-$SAVED_KERNEL_VERSION ]; then
-                    chosen_kernel="/vmlinuz-$SAVED_KERNEL_VERSION"
-                    chosen_initrd="/initrd.img-$SAVED_KERNEL_VERSION"
-__FALLBACK_KERNEL_CHECKS__
-                elif [ -f __KERNEL_DIR__/vmlinuz ]; then
-                    chosen_kernel="__KERNEL_DIR__/vmlinuz"
-                    chosen_initrd="__KERNEL_DIR__/initrd.img"
-                elif [ -f /boot/vmlinuz ]; then
-                    chosen_kernel="/boot/vmlinuz"
-                    chosen_initrd="/boot/initrd.img"
-                elif [ -f /vmlinuz ]; then
-                    chosen_kernel="/vmlinuz"
-                    chosen_initrd="/initrd.img"
-                fi
-                if [ -n "$chosen_kernel" ]; then
-                    linux $chosen_kernel root=__ROOT_SPEC__ ro __DEFAULT_CMDLINE__ noresume
-                    if [ -n "$chosen_initrd" ]; then
-                        initrd $chosen_initrd
-                    fi
-                    boot
-                fi
+__CLEAN_BOOT_SELECTOR__
             }
 
             menuentry "[SAFEGUARD] 3. Force Resume Anyway (Dangerous - May Panic)" --id=safeguard_force {
                 echo "Loading kernel for forced resume..."
                 search --no-floppy --fs-uuid --set=root __BOOT_UUID__
-                chosen_kernel=""
-                chosen_initrd=""
-                if [ -n "$SAVED_KERNEL_VERSION" ] && [ -f __KERNEL_DIR__/vmlinuz-$SAVED_KERNEL_VERSION ]; then
-                    chosen_kernel="__KERNEL_DIR__/vmlinuz-$SAVED_KERNEL_VERSION"
-                    chosen_initrd="__KERNEL_DIR__/initrd.img-$SAVED_KERNEL_VERSION"
-                elif [ -n "$SAVED_KERNEL_VERSION" ] && [ -f /boot/vmlinuz-$SAVED_KERNEL_VERSION ]; then
-                    chosen_kernel="/boot/vmlinuz-$SAVED_KERNEL_VERSION"
-                    chosen_initrd="/boot/initrd.img-$SAVED_KERNEL_VERSION"
-                elif [ -n "$SAVED_KERNEL_VERSION" ] && [ -f /vmlinuz-$SAVED_KERNEL_VERSION ]; then
-                    chosen_kernel="/vmlinuz-$SAVED_KERNEL_VERSION"
-                    chosen_initrd="/initrd.img-$SAVED_KERNEL_VERSION"
-__FALLBACK_KERNEL_CHECKS__
-                elif [ -f __KERNEL_DIR__/vmlinuz ]; then
-                    chosen_kernel="__KERNEL_DIR__/vmlinuz"
-                    chosen_initrd="__KERNEL_DIR__/initrd.img"
-                elif [ -f /boot/vmlinuz ]; then
-                    chosen_kernel="/boot/vmlinuz"
-                    chosen_initrd="/boot/initrd.img"
-                elif [ -f /vmlinuz ]; then
-                    chosen_kernel="/vmlinuz"
-                    chosen_initrd="/initrd.img"
-                fi
-                if [ -n "$chosen_kernel" ]; then
-                    linux $chosen_kernel root=__ROOT_SPEC__ ro __DEFAULT_CMDLINE__ __RESUME_PARAM__
-                    if [ -n "$chosen_initrd" ]; then
-                        initrd $chosen_initrd
-                    fi
-                    boot
-                fi
+__FORCE_BOOT_SELECTOR__
             }
 
             # Enforce preselected default to safe power off
@@ -1693,44 +1724,13 @@ __FALLBACK_KERNEL_CHECKS__
     fi
 fi
 __SENTINEL_END__"""
-    # Discover installed versioned kernels in /boot to ensure versioned GRUB references
-    installed_versions = []
-    curr_k = os.uname().release
-    if curr_k:
-        installed_versions.append(curr_k)
-
-    boot_dir = Path("/boot")
-    if boot_dir.is_dir():
-        for kfile in sorted(boot_dir.glob("vmlinuz-*"), reverse=True):
-            if kfile.is_file() and not kfile.is_symlink():
-                v = kfile.name[len("vmlinuz-") :].strip()
-                if v and v not in installed_versions:
-                    installed_versions.append(v)
-
-    fallback_checks = []
-    for v in installed_versions:
-        fallback_checks.append(
-            f"                elif [ -f __KERNEL_DIR__/vmlinuz-{v} ]; then\n"
-            f'                    chosen_kernel="__KERNEL_DIR__/vmlinuz-{v}"\n'
-            f'                    chosen_initrd="__KERNEL_DIR__/initrd.img-{v}"\n'
-            f"                elif [ -f /boot/vmlinuz-{v} ]; then\n"
-            f'                    chosen_kernel="/boot/vmlinuz-{v}"\n'
-            f'                    chosen_initrd="/boot/initrd.img-{v}"\n'
-            f"                elif [ -f /vmlinuz-{v} ]; then\n"
-            f'                    chosen_kernel="/vmlinuz-{v}"\n'
-            f'                    chosen_initrd="/initrd.img-{v}"'
-        )
-    fallback_checks_str = "\n".join(fallback_checks)
 
     safeguard_block = (
         template_block.replace("__SENTINEL_START__", sentinel_start)
         .replace("__SENTINEL_END__", sentinel_end)
         .replace("__BOOT_UUID__", boot_uuid)
-        .replace("__ROOT_SPEC__", root_spec)
-        .replace("__KERNEL_DIR__", kernel_dir)
-        .replace("__DEFAULT_CMDLINE__", default_cmdline)
-        .replace("__RESUME_PARAM__", resume_param)
-        .replace("__FALLBACK_KERNEL_CHECKS__", fallback_checks_str)
+        .replace("__CLEAN_BOOT_SELECTOR__", clean_selector)
+        .replace("__FORCE_BOOT_SELECTOR__", force_selector)
     )
 
     standard_header = """#!/bin/sh
