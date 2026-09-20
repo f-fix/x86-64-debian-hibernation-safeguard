@@ -85,7 +85,7 @@ Hibernating Linux writes the complete active memory state and kernel registers t
 `x86-64-debian-hibernation-safeguard` provides an automated **dual-stage hardware verification and isolation framework**:
 1. **Early Bootloader Validation (GRUB / systemd-boot):** Compares the machine's SMBIOS DMI information (vendor, model, BIOS version, baseboard, and processor) against the saved hibernation record before the kernel boots. Disables automatic timer countdowns, displays changed hardware attributes, and presents safe recovery options (Safe Power Off preselected, Clean Boot, and Force Resume).
 2. **Early Initramfs Validation:** Mounts `/boot` strictly read-only for a few milliseconds, immediately unmounts it, and validates Kernel version, DMI parameters, CPU model, numeric RAM capacity (with dynamic tolerance for stolen memory), and permanent hardware MAC addresses.
-3. **Safe Interactive Confirmation (Anti-Passphrase Leak):** Uses a dedicated compiled C evdev micro-daemon (`hibernation-resume-prompt`) as the primary interactive prompt in early initramfs, supporting both Plymouth splash screens (live in-place prompt line updates) and text consoles. Requires full words (`yes`, `no`, `force`) with **zero plaintext echoing** of passwords typed in error. If the C binary is missing, non-executable, or exits abnormally/crashes, a compact shell-based fallback (using `plymouth ask-question` or regular console input with normal text echo) prompts the user until a valid confirmation is entered.
+3. **Safe Interactive Confirmation (Anti-Passphrase Leak):** Uses a dedicated compiled C evdev micro-daemon (`hibernation-resume-prompt`) as the primary interactive prompt in early initramfs, supporting both Plymouth splash screens (live in-place prompt line updates) and text consoles. Requires full words (`yes`, `no`, `force`) with **zero plaintext echoing** of passwords typed in error (any input that is not a case-insensitive prefix of `yes`, `no`, or `force` is masked as `*`, and Enter discards invalid input). If the C binary is missing, non-executable, or exits abnormally/crashes, a compact shell-based fallback (using `plymouth ask-question` or regular console input with normal text echo) prompts the user until a valid confirmation is entered.
 4. **Resilient Discard (LUKS, LVM, and Plain Swap):** Selecting discard neutralizes resume binaries, zeroes `/sys/power/resume`, and sanitizes swap suspend signatures (`S1SUSPEND`/`S2SUSPEND` -> `SWAPSPACE2`) on plain partitions and inside LUKS/LVM volumes once unlocked.
 5. **Boot Mount Isolation & Strict Early Read-Only:** Attempts to sync dirty buffers and unmount `/boot/efi` (if present) and `/boot` immediately prior to hibernation, and attempts to remount them immediately after resumption. Strictly isolates `/boot` as read-only during GRUB and initramfs (never mounting rw or writing in early boot), and communicates state transitions safely via `/run` tmpfs.
 
@@ -190,6 +190,7 @@ C_PROMPT_SOURCE = r"""
 #include <poll.h>
 #include <signal.h>
 #include <string.h>
+#include <strings.h>
 #include <ctype.h>
 #include <glob.h>
 #include <errno.h>
@@ -216,9 +217,34 @@ static int check_plymouth(void) {
     return 0;
 }
 
+static int is_valid_prefix_or_match(const char *s) {
+    if (!s || !*s) return 1;
+    size_t len = strlen(s);
+    if (len <= 3 && strncasecmp(s, "yes", len) == 0) return 1;
+    if (len <= 2 && strncasecmp(s, "no", len) == 0) return 1;
+    if (len <= 5 && strncasecmp(s, "force", len) == 0) return 1;
+    return 0;
+}
+
+static void get_display_string(char *out, size_t max_out) {
+    if (is_valid_prefix_or_match(input_buf)) {
+        snprintf(out, max_out, "%s", input_buf);
+    } else {
+        size_t len = strlen(input_buf);
+        if (len >= max_out) len = max_out - 1;
+        for (size_t i = 0; i < len; i++) {
+            out[i] = '*';
+        }
+        out[len] = '\0';
+    }
+}
+
 static void update_display(void) {
+    char disp[64];
+    get_display_string(disp, sizeof(disp));
+
     char full_prompt[160];
-    snprintf(full_prompt, sizeof(full_prompt), "%s%s", PROMPT_PREFIX, input_buf);
+    snprintf(full_prompt, sizeof(full_prompt), "%s%s", PROMPT_PREFIX, disp);
 
     if (plymouth_active) {
         char cmd[256];
@@ -227,7 +253,7 @@ static void update_display(void) {
         (void)r;
     }
 
-    // Also write to /dev/console and /dev/tty0 for direct text console visibility
+    // Also write to /dev/console for direct text console visibility
     int cfd = open("/dev/console", O_WRONLY | O_NOCTTY);
     if (cfd >= 0) {
         char line[200];
@@ -379,7 +405,15 @@ int main(int argc, char **argv) {
                             return 1;
                         }
 
-                        // Enter key -> Submit answer
+                        // Escape key -> Discard input buffer and re-prompt
+                        if (ev.code == KEY_ESC) {
+                            buf_len = 0;
+                            input_buf[0] = '\0';
+                            update_display();
+                            continue;
+                        }
+
+                        // Enter key -> Submit answer if match; otherwise discard input string
                         if (ev.code == KEY_ENTER || ev.code == KEY_KPENTER) {
                             if (strcasecmp(input_buf, "yes") == 0) {
                                 if (plymouth_active) system("plymouth message --text=\"[CONFIRMED] Clean boot (discard snapshot)...\" 2>/dev/null");
@@ -409,7 +443,13 @@ int main(int argc, char **argv) {
                                 }
                                 return 2; // 2 = force resume
                             } else {
-                                // Invalid input: reset buffer and re-prompt
+                                // Enter discards the input string if it doesn't match yes/no/force
+                                int cfd = open("/dev/console", O_WRONLY | O_NOCTTY);
+                                if (cfd >= 0) {
+                                    ssize_t w = write(cfd, "\n", 1);
+                                    (void)w;
+                                    close(cfd);
+                                }
                                 buf_len = 0;
                                 input_buf[0] = '\0';
                                 update_display();
@@ -1882,7 +1922,38 @@ if [ -n "$SAVED_KERNEL" ] || [ -n "$SAVED_CPU" ] || [ -n "$SAVED_SYS_VENDOR" ] |
 fi
 
 if [ "$HAS_MISMATCH" = true ]; then
-    echo "[SAFEGUARD] Hibernation hardware/kernel mismatch detected since hibernation."
+    CONSOLE_OUT="/dev/console"
+    [ ! -c "$CONSOLE_OUT" ] && CONSOLE_OUT="/dev/tty0"
+    [ ! -c "$CONSOLE_OUT" ] && CONSOLE_OUT=""
+
+    print_console() {
+        if [ -n "$CONSOLE_OUT" ]; then
+            printf "%b\n" "$1" > "$CONSOLE_OUT" 2>/dev/null || printf "%b\n" "$1"
+        else
+            printf "%b\n" "$1"
+        fi
+    }
+
+    print_console "============================================================"
+    print_console "  [SAFEGUARD] HIBERNATION HARDWARE MISMATCH DETECTED!"
+    print_console "============================================================"
+    print_console "Hardware changes detected since hibernation:"
+    if [ "$KERNEL_MISMATCH" = true ]; then
+        print_console "  Kernel Version:  '$SAVED_KERNEL' -> '$CURRENT_KERNEL'"
+    fi
+    if [ "$CPU_MISMATCH" = true ]; then
+        print_console "  Processor / CPU: '$SAVED_CPU' -> '$CURRENT_CPU'"
+    fi
+    if [ "$RAM_MISMATCH" = true ]; then
+        print_console "  Memory Total:    '$SAVED_RAM' -> '$CURRENT_RAM'"
+    fi
+    if [ "$MAC_MISMATCH" = true ]; then
+        print_console "  Permanent MAC:   '$SAVED_MAC' -> '$CURRENT_MAC' ($SAVED_MAC_IFACE)"
+    fi
+    if [ -n "$DMI_MISMATCH_DETAILS" ]; then
+        printf "%b" "$DMI_MISMATCH_DETAILS" > "$CONSOLE_OUT" 2>/dev/null || printf "%b" "$DMI_MISMATCH_DETAILS"
+    fi
+    print_console "============================================================"
 
     user_input=""
 
@@ -1922,13 +1993,10 @@ if [ "$HAS_MISMATCH" = true ]; then
                     plymouth quit 2>/dev/null || true
                 fi
             else
-                CONSOLE_OUT=""
                 CONSOLE_IN=""
-                if [ -c /dev/console ] && [ -w /dev/console ] && [ -r /dev/console ]; then
-                    CONSOLE_OUT="/dev/console"
+                if [ -c /dev/console ] && [ -r /dev/console ]; then
                     CONSOLE_IN="/dev/console"
-                elif [ -c /dev/tty0 ] && [ -w /dev/tty0 ] && [ -r /dev/tty0 ]; then
-                    CONSOLE_OUT="/dev/tty0"
+                elif [ -c /dev/tty0 ] && [ -r /dev/tty0 ]; then
                     CONSOLE_IN="/dev/tty0"
                 fi
 
