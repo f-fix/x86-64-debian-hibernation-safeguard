@@ -13,9 +13,9 @@ Hibernating Linux writes the complete active memory state and kernel registers t
 `x86-64-debian-hibernation-safeguard` provides an automated **dual-stage hardware verification and isolation framework**:
 1. **Early Bootloader Validation (GRUB / systemd-boot):** Compares the machine's SMBIOS DMI information (vendor, model, BIOS version, baseboard, and processor) against the saved hibernation record before the kernel boots. Disables automatic timer countdowns, displays changed hardware attributes, and presents safe recovery options (Safe Power Off preselected, Clean Boot, and Force Resume).
 2. **Early Initramfs Validation:** Mounts `/boot` strictly read-only for a few milliseconds, immediately unmounts it, and validates Kernel version, DMI parameters, CPU model, numeric RAM capacity (with dynamic tolerance for stolen memory), and permanent hardware MAC addresses.
-3. **Safe Interactive Confirmation (Anti-Passphrase Leak):** Uses a dedicated non-password interactive filter loop with a compiled C evdev listener supporting both Plymouth splash screens (live in-place prompt line updates) and text consoles. Requires full words (`yes`, `no`, `force`) with **zero plaintext echoing** of passwords typed in error.
+3. **Safe Interactive Confirmation (Anti-Passphrase Leak):** Uses a dedicated compiled C evdev micro-daemon (`hibernation-resume-prompt`) as the primary interactive prompt in early initramfs, supporting both Plymouth splash screens (live in-place prompt line updates) and text consoles. Requires full words (`yes`, `no`, `force`) with **zero plaintext echoing** of passwords typed in error. If the C binary is missing, non-executable, or exits abnormally/crashes, a compact shell-based fallback (using `plymouth ask-question` or regular console input with normal text echo) prompts the user until a valid confirmation is entered.
 4. **Resilient Discard (LUKS, LVM, and Plain Swap):** Selecting discard neutralizes resume binaries, zeroes `/sys/power/resume`, and sanitizes swap suspend signatures (`S1SUSPEND`/`S2SUSPEND` -> `SWAPSPACE2`) on plain partitions and inside LUKS/LVM volumes once unlocked.
-5. **Strict Early Read-Only Isolation:** Never writes to or mounts `/boot` rw in early boot. Communicates state transitions via `/run` tmpfs, allowing userspace services to manage all target files safely.
+5. **Boot Mount Isolation & Strict Early Read-Only:** Attempts to sync dirty buffers and unmount `/boot/efi` (if present) and `/boot` immediately prior to hibernation, and attempts to remount them immediately after resumption. Strictly isolates `/boot` as read-only during GRUB and initramfs (never mounting rw or writing in early boot), and communicates state transitions safely via `/run` tmpfs.
 
 ---
 
@@ -46,7 +46,16 @@ sudo python3 x86-64-debian-hibernation-safeguard.py --install
 
 *(Note: If executed without root, the script automatically attempts privilege self-elevation via `sudo`, `doas`, or `pkexec`).*
 
-### 3. Display Documentation / Help (`--help` or `-h`)
+### 3. Completely Uninstall the Safeguard (`--uninstall`)
+To completely and surgically uninstall all safeguard hooks, native prompt binaries, systemd services, and configuration blocks (including any legacy artifacts from previous versions), and recompile clean boot images:
+
+```bash
+sudo python3 x86-64-debian-hibernation-safeguard.py --uninstall
+```
+
+*(Note: If executed without root, the script automatically attempts privilege self-elevation via `sudo`, `doas`, or `pkexec`).*
+
+### 4. Display Documentation / Help (`--help` or `-h`)
 To display this full manual using the standard Python help pager:
 
 ```bash

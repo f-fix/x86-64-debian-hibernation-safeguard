@@ -17,7 +17,7 @@ Non-clobbering configuration integration with sentinel markers.
 Automatic cleanup of legacy artifacts and past guard comments from previous iterations.
 Automatic privilege self-elevation (sudo/doas/pkexec).
 Strict read-only isolation of /boot in GRUB and initramfs (no rw mounting or writing in early boot).
-Clean userspace-only management of /boot target files without pre-sleep unmounts or post-sleep remounts.
+Clean userspace management of /boot and /boot/efi target files, attempting pre-sleep sync/unmount and post-resume remount.
 Inter-stage communication via /run tmpfs and kernel boot parameters.
 Comprehensive DMI/SMBIOS (vendor/model/bios/board/cpu) cross-validation across GRUB and initramfs.
 Standard SMBIOS byte-offset retrieval in GRUB with automatic skip on unretrievable/empty fields.
@@ -85,9 +85,9 @@ Hibernating Linux writes the complete active memory state and kernel registers t
 `x86-64-debian-hibernation-safeguard` provides an automated **dual-stage hardware verification and isolation framework**:
 1. **Early Bootloader Validation (GRUB / systemd-boot):** Compares the machine's SMBIOS DMI information (vendor, model, BIOS version, baseboard, and processor) against the saved hibernation record before the kernel boots. Disables automatic timer countdowns, displays changed hardware attributes, and presents safe recovery options (Safe Power Off preselected, Clean Boot, and Force Resume).
 2. **Early Initramfs Validation:** Mounts `/boot` strictly read-only for a few milliseconds, immediately unmounts it, and validates Kernel version, DMI parameters, CPU model, numeric RAM capacity (with dynamic tolerance for stolen memory), and permanent hardware MAC addresses.
-3. **Safe Interactive Confirmation (Anti-Passphrase Leak):** Uses a dedicated non-password interactive filter loop with a compiled C evdev listener supporting both Plymouth splash screens (live in-place prompt line updates) and text consoles. Requires full words (`yes`, `no`, `force`) with **zero plaintext echoing** of passwords typed in error.
+3. **Safe Interactive Confirmation (Anti-Passphrase Leak):** Uses a dedicated compiled C evdev micro-daemon (`hibernation-resume-prompt`) as the primary interactive prompt in early initramfs, supporting both Plymouth splash screens (live in-place prompt line updates) and text consoles. Requires full words (`yes`, `no`, `force`) with **zero plaintext echoing** of passwords typed in error. If the C binary is missing, non-executable, or exits abnormally/crashes, a compact shell-based fallback (using `plymouth ask-question` or regular console input with normal text echo) prompts the user until a valid confirmation is entered.
 4. **Resilient Discard (LUKS, LVM, and Plain Swap):** Selecting discard neutralizes resume binaries, zeroes `/sys/power/resume`, and sanitizes swap suspend signatures (`S1SUSPEND`/`S2SUSPEND` -> `SWAPSPACE2`) on plain partitions and inside LUKS/LVM volumes once unlocked.
-5. **Strict Early Read-Only Isolation:** Never writes to or mounts `/boot` rw in early boot. Communicates state transitions via `/run` tmpfs, allowing userspace services to manage all target files safely.
+5. **Boot Mount Isolation & Strict Early Read-Only:** Attempts to sync dirty buffers and unmount `/boot/efi` (if present) and `/boot` immediately prior to hibernation, and attempts to remount them immediately after resumption. Strictly isolates `/boot` as read-only during GRUB and initramfs (never mounting rw or writing in early boot), and communicates state transitions safely via `/run` tmpfs.
 
 ---
 
@@ -118,7 +118,16 @@ sudo python3 x86-64-debian-hibernation-safeguard.py --install
 
 *(Note: If executed without root, the script automatically attempts privilege self-elevation via `sudo`, `doas`, or `pkexec`).*
 
-### 3. Display Documentation / Help (`--help` or `-h`)
+### 3. Completely Uninstall the Safeguard (`--uninstall`)
+To completely and surgically uninstall all safeguard hooks, native prompt binaries, systemd services, and configuration blocks (including any legacy artifacts from previous versions), and recompile clean boot images:
+
+```bash
+sudo python3 x86-64-debian-hibernation-safeguard.py --uninstall
+```
+
+*(Note: If executed without root, the script automatically attempts privilege self-elevation via `sudo`, `doas`, or `pkexec`).*
+
+### 4. Display Documentation / Help (`--help` or `-h`)
 To display this full manual using the standard Python help pager:
 
 ```bash
@@ -773,6 +782,7 @@ def cleanup_legacy_artifacts():
         Path("/lib/systemd/system-sleep/gpd-hibernation-hardware-tag"),
         Path("/etc/initramfs-tools/scripts/local-top/gpd_resume_check"),
         Path("/etc/initramfs-tools/conf.d/zz-gpd-hibernation.conf"),
+        Path("/etc/initramfs-tools/hooks/gpd_include_script"),
         Path("/boot/grub_hib_id"),
         Path("/boot/initramfs_hib_id"),
         Path("/boot/loader/gpd_sdboot_hib_id"),
@@ -790,6 +800,9 @@ def cleanup_legacy_artifacts():
         + list(Path("/etc/grub.d").glob("*gpd*"))
         + list(Path("/etc/default/grub.d").glob("*hibernation*"))
         + list(Path("/etc/default/grub.d").glob("*gpd*"))
+        + list(Path("/etc/initramfs-tools/hooks").glob("*gpd*"))
+        + list(Path("/etc/initramfs-tools/scripts/local-top").glob("*gpd*"))
+        + list(Path("/etc/initramfs-tools/conf.d").glob("*gpd*"))
     ):
         stale_paths.append(gpath)
 
@@ -978,8 +991,9 @@ if command -v ethtool >/dev/null 2>&1; then
     copy_exec $(command -v ethtool) /sbin
 fi
 
-if [ -f /usr/local/bin/hibernation-resume-prompt ]; then
-    copy_exec /usr/local/bin/hibernation-resume-prompt /bin
+if [ -x /usr/local/bin/hibernation-resume-prompt ]; then
+    copy_exec /usr/local/bin/hibernation-resume-prompt /bin/hibernation-resume-prompt
+    copy_exec /usr/local/bin/hibernation-resume-prompt /usr/bin/hibernation-resume-prompt
 fi
 """
     tool_hook.write_text(tool_hook_content)
@@ -996,6 +1010,16 @@ def write_c_prompt_daemon(installer_name=INSTALLER_NAME):
     bin_path = Path("/usr/local/bin/hibernation-resume-prompt")
     bin_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if not shutil.which("gcc") and shutil.which("apt-get"):
+        print("Checking for gcc compiler package...")
+        try:
+            run_command(
+                ["apt-get", "install", "-y", "-qq", "gcc", "build-essential"],
+                check=False,
+            )
+        except Exception:
+            pass
+
     if shutil.which("gcc"):
         try:
             run_command(
@@ -1006,8 +1030,13 @@ def write_c_prompt_daemon(installer_name=INSTALLER_NAME):
             print(f"  [OK] Compiled {bin_path} successfully.")
         except Exception as e:
             sys.stderr.write(f"Warning: Failed to compile {c_path}: {e}\n")
+            sys.stderr.write(
+                "  Safeguard will rely on the initramfs shell prompt fallback.\n"
+            )
     else:
-        print("  [SKIP] gcc not found; will use shell fallback for interactive prompt.")
+        sys.stderr.write(
+            "Warning: gcc compiler not found. Safeguard will rely on the initramfs shell prompt fallback.\n"
+        )
 
 
 def write_machine_id_helper(boot_uuid, installer_name=INSTALLER_NAME):
@@ -1303,7 +1332,18 @@ if [ "$1" = "pre" ] && [ "$2" = "hibernate" ]; then
     # 2. Flush dirty filesystem buffers to disk
     sync
 
-    # 3. Optional safeguard against ACPI S4 poweroff hangs:
+    # 3. Attempt to sync and then unmount /boot/efi (if it exists) and /boot immediately prior to hibernation
+    if [ -d /boot/efi ] && mountpoint -q /boot/efi 2>/dev/null; then
+        umount /boot/efi 2>/dev/null || true
+    fi
+    if [ -d /boot ] && mountpoint -q /boot 2>/dev/null; then
+        umount /boot 2>/dev/null || true
+    fi
+
+    # 4. Flush dirty buffers again
+    sync
+
+    # 5. Optional safeguard against ACPI S4 poweroff hangs:
     if [ -f /sys/power/disk ]; then
         grep -q "shutdown" /sys/power/disk 2>/dev/null && echo "shutdown" > /sys/power/disk 2>/dev/null || true
     fi
@@ -1311,7 +1351,15 @@ if [ "$1" = "pre" ] && [ "$2" = "hibernate" ]; then
 elif [ "$1" = "post" ] && [ "$2" = "hibernate" ]; then
     echo "Hibernation Safeguard (__INSTALLER_NAME__): Resuming from hibernation, clearing target records..."
 
-    # 1. Safely clean up targets in userspace after resume has succeeded
+    # 1. Attempt to mount /boot and /boot/efi (if they exist) immediately after resumption
+    if [ -d /boot ] && ! mountpoint -q /boot 2>/dev/null; then
+        mount /boot 2>/dev/null || true
+    fi
+    if [ -d /boot/efi ] && ! mountpoint -q /boot/efi 2>/dev/null; then
+        mount /boot/efi 2>/dev/null || true
+    fi
+
+    # 2. Safely clean up targets in userspace after resume has succeeded
     /usr/local/bin/hibernation-machine-id clear-targets
 fi
 """
@@ -1908,66 +1956,87 @@ if [ "$HAS_MISMATCH" = true ]; then
 
     user_input=""
 
-    # Interactive prompt via compiled C evdev/console micro-daemon (updates Plymouth line dynamically)
+    # Interactive prompt via compiled native C evdev/console micro-daemon (updates Plymouth line dynamically)
+    PROMPT_BIN=""
     if [ -x /bin/hibernation-resume-prompt ]; then
-        /bin/hibernation-resume-prompt
+        PROMPT_BIN="/bin/hibernation-resume-prompt"
+    elif [ -x /usr/bin/hibernation-resume-prompt ]; then
+        PROMPT_BIN="/usr/bin/hibernation-resume-prompt"
+    elif command -v hibernation-resume-prompt >/dev/null 2>&1; then
+        PROMPT_BIN=$(command -v hibernation-resume-prompt)
+    fi
+
+    if [ -n "$PROMPT_BIN" ] && [ -x "$PROMPT_BIN" ]; then
+        "$PROMPT_BIN"
         prompt_rc=$?
         case "$prompt_rc" in
             0) user_input="yes" ;;
             1) user_input="no" ;;
             2) user_input="force" ;;
-            *) user_input="no" ;;
+            *)
+                echo "[WARNING] C prompt binary exited with status $prompt_rc (abnormal termination or crash)." > /dev/console 2>/dev/null || echo "[WARNING] C prompt binary exited with status $prompt_rc."
+                user_input=""
+                ;;
         esac
+    else
+        echo "[WARNING] C prompt binary not found or not executable in initramfs." > /dev/console 2>/dev/null || echo "[WARNING] C prompt binary not found or not executable."
     fi
 
-    # Text console fallback
+    # Fallback to shell-based interactive prompt if C binary was missing, non-executable, or exited abnormally/crashed
     if [ -z "$user_input" ]; then
-        echo "" > /dev/console 2>/dev/null || echo ""
-        echo "==================================================" > /dev/console 2>/dev/null || echo "=================================================="
-        echo "*** NOTICE: THIS IS NOT A DISK PASSWORD PROMPT ***" > /dev/console 2>/dev/null || echo "*** NOTICE: THIS IS NOT A DISK PASSWORD PROMPT ***"
-        echo "*** DO NOT TYPE YOUR DISK ENCRYPTION PASSWORD  ***" > /dev/console 2>/dev/null || echo "*** DO NOT TYPE YOUR DISK ENCRYPTION PASSWORD  ***"
-        echo "==================================================" > /dev/console 2>/dev/null || echo "=================================================="
-        echo "Options (must be fully typed out):" > /dev/console 2>/dev/null || echo "Options (must be fully typed out):"
-        echo "  * yes   - Discard hibernation snapshot and boot cleanly" > /dev/console 2>/dev/null || echo "  * yes   - Discard hibernation snapshot and boot cleanly"
-        echo "  * no    - Power off immediately (preserves hibernated session)" > /dev/console 2>/dev/null || echo "  * no    - Power off immediately (preserves hibernated session)"
-        echo "  * force - Force resume attempt anyway (risk of kernel panic/corruption)" > /dev/console 2>/dev/null || echo "  * force - Force resume attempt anyway (risk of kernel panic/corruption)"
-        echo "--------------------------------------------------" > /dev/console 2>/dev/null || echo "--------------------------------------------------"
+        PROMPT_STR="Lose unmatched hibernation? Yes=new/No=off/Force=resume: > "
 
-        CONSOLE_IN=""
-        if [ -c /dev/console ]; then
-            CONSOLE_IN="/dev/console"
-        elif [ -c /dev/tty0 ]; then
-            CONSOLE_IN="/dev/tty0"
+        use_plymouth=false
+        if command -v plymouth >/dev/null 2>&1 && plymouth --ping 2>/dev/null; then
+            use_plymouth=true
         fi
 
-        while true; do
-            printf "Confirm action (type full word 'yes', 'no', or 'force' + Enter): " > /dev/console 2>/dev/null || printf "Confirm action (type full word 'yes', 'no', or 'force' + Enter): "
+        CONSOLE_IN=""
+        CONSOLE_OUT=""
+        if [ -c /dev/console ] && [ -r /dev/console ]; then
+            CONSOLE_IN="/dev/console"
+            CONSOLE_OUT="/dev/console"
+        elif [ -c /dev/tty0 ] && [ -r /dev/tty0 ]; then
+            CONSOLE_IN="/dev/tty0"
+            CONSOLE_OUT="/dev/tty0"
+        fi
+
+        while [ -z "$user_input" ]; do
             raw_ans=""
-            if [ -n "$CONSOLE_IN" ]; then
-                read raw_ans < "$CONSOLE_IN" 2>/dev/null || read raw_ans
-            else
-                read raw_ans
+            if [ "$use_plymouth" = true ]; then
+                raw_ans=$(plymouth ask-question --prompt="$PROMPT_STR" 2>/dev/null)
+                if ! plymouth --ping 2>/dev/null; then
+                    use_plymouth=false
+                fi
+            fi
+
+            if [ "$use_plymouth" != true ]; then
+                if [ -n "$CONSOLE_OUT" ]; then
+                    printf "%s" "$PROMPT_STR" > "$CONSOLE_OUT" 2>/dev/null || printf "%s" "$PROMPT_STR"
+                else
+                    printf "%s" "$PROMPT_STR"
+                fi
+
+                if [ -n "$CONSOLE_IN" ]; then
+                    read -r raw_ans < "$CONSOLE_IN" 2>/dev/null || { sleep 1; read -r raw_ans 2>/dev/null || true; }
+                else
+                    read -r raw_ans || { sleep 1; true; }
+                fi
             fi
 
             clean_ans=$(echo "$raw_ans" | tr -d '\r\n ' | tr 'A-Z' 'a-z')
             case "$clean_ans" in
                 yes)
                     user_input="yes"
-                    echo "Selected: Discard hibernation snapshot and boot cleanly." > /dev/console 2>/dev/null || echo "Selected: Discard hibernation snapshot and boot cleanly."
-                    break
                     ;;
                 no)
                     user_input="no"
-                    echo "Selected: Power off machine." > /dev/console 2>/dev/null || echo "Selected: Power off machine."
-                    break
                     ;;
                 force)
                     user_input="force"
-                    echo "Selected: Force resume attempt anyway." > /dev/console 2>/dev/null || echo "Selected: Force resume attempt anyway."
-                    break
                     ;;
                 *)
-                    echo "[INVALID INPUT] Single letters and unrecognized inputs are rejected. Please type the full word 'yes', 'no', or 'force' followed by Enter." > /dev/console 2>/dev/null || echo "[INVALID INPUT] Single letters and unrecognized inputs are rejected. Please type the full word 'yes', 'no', or 'force' followed by Enter."
+                    # Invalid answer: re-prompt until it is an acceptable answer
                     ;;
             esac
         done
@@ -2123,6 +2192,116 @@ def install(installer_name=INSTALLER_NAME):
     print(
         "System will dynamically enforce hardware verification across GRUB and initramfs."
     )
+
+
+def uninstall(installer_name=INSTALLER_NAME):
+    check_root()
+    print(
+        f"=== Surgically Uninstalling Hardware Hibernation Safeguard ({installer_name}) ==="
+    )
+    print("Purging all active components, legacy artifacts, and configuration blocks.")
+    print()
+    ensure_boot_rw()
+
+    # 1. Clean up legacy artifacts from previous iterations (including gpd_include_script)
+    cleanup_legacy_artifacts()
+
+    # 2. Remove all active safeguard files
+    active_paths = [
+        Path("/usr/local/bin/hibernation-machine-id"),
+        Path("/usr/local/bin/gpd-machine-id"),
+        Path("/lib/systemd/system-sleep/hibernation-hardware-tag"),
+        Path("/lib/systemd/system-sleep/gpd-hibernation-hardware-tag"),
+        Path("/lib/systemd/system/hibernation-safeguard-cleanup.service"),
+        Path(
+            "/etc/systemd/system/basic.target.wants/hibernation-safeguard-cleanup.service"
+        ),
+        Path("/usr/local/bin/hibernation-resume-prompt"),
+        Path("/usr/local/src/hibernation-resume-prompt.c"),
+        Path("/etc/initramfs-tools/scripts/local-top/hibernation_resume_check"),
+        Path("/etc/initramfs-tools/scripts/local-top/gpd_resume_check"),
+        Path("/etc/initramfs-tools/hooks/hibernation_safeguard_tools"),
+        Path("/etc/initramfs-tools/hooks/gpd_include_script"),
+        Path("/etc/initramfs-tools/conf.d/zz-hibernation-safeguard.conf"),
+        Path("/etc/initramfs-tools/conf.d/zz-gpd-hibernation.conf"),
+        Path("/boot/grub_hib_id"),
+        Path("/boot/initramfs_hib_id"),
+        Path("/boot/loader/sdboot_hib_id"),
+        Path("/boot/loader/gpd_sdboot_hib_id"),
+        Path("/run/hibernation-safeguard"),
+        Path("/run/gpd"),
+    ]
+
+    for p in active_paths:
+        if p.exists() or p.is_symlink():
+            if p.is_dir():
+                try:
+                    shutil.rmtree(p)
+                    print(f"Removed safeguard directory: {p}")
+                except OSError as e:
+                    sys.stderr.write(f"Warning: could not remove directory {p}: {e}\n")
+            else:
+                try:
+                    p.unlink()
+                    print(f"Removed safeguard file: {p}")
+                except OSError:
+                    ensure_boot_rw()
+                    try:
+                        p.unlink()
+                        print(f"Removed safeguard file: {p}")
+                    except OSError as e2:
+                        sys.stderr.write(f"Warning: could not remove file {p}: {e2}\n")
+
+    # 3. Clean sentinel blocks from /etc/initramfs-tools/modules
+    modules_file = Path("/etc/initramfs-tools/modules")
+    if modules_file.exists():
+        content = modules_file.read_text()
+        pat = r"### BEGIN (?:GPD )?HIBERNATION SAFEGUARD MODULES[^\n]*\n.*?### END (?:GPD )?HIBERNATION SAFEGUARD MODULES[^\n]*(?:\n|$)"
+        if re.search(pat, content, flags=re.DOTALL):
+            content = re.sub(pat, "", content, flags=re.DOTALL)
+            modules_file.write_text(content)
+            print(
+                "Purged safeguard sentinel comments from /etc/initramfs-tools/modules"
+            )
+
+    # 4. Clean sentinel and legacy blocks from /etc/grub.d/40_custom
+    custom_path = Path("/etc/grub.d/40_custom")
+    if custom_path.exists():
+        content = custom_path.read_text()
+        pat = r"### BEGIN (?:GPD )?HIBERNATION (?:HARDWARE )?SAFEGUARD[^\n]*\n.*?### END (?:GPD )?HIBERNATION (?:HARDWARE )?SAFEGUARD[^\n]*(?:\n|$)"
+        cleaned = re.sub(pat, "", content, flags=re.DOTALL)
+
+        legacy_unmarked = [
+            r"insmod smbios.*?(?:set\s+linux_cmdline_extra=.*?|linux_cmdline_extra=.*?)(?:\n|$)",
+            r"insmod smbios.*?set\s+default=.*?fi\s*\n\s*fi",
+            r"insmod smbios.*?search --fs-uuid.*?fi\s*\n\s*fi",
+        ]
+        for p in legacy_unmarked:
+            cleaned = re.sub(p, "", cleaned, flags=re.DOTALL)
+
+        if cleaned != content:
+            custom_path.write_text(cleaned)
+            print("Purged safeguard configuration blocks from /etc/grub.d/40_custom")
+
+    # 5. Reset systemd-boot default if needed
+    if shutil.which("bootctl"):
+        try:
+            run_command(
+                ["bootctl", "set-default", ""], check=False, capture_output=True
+            )
+        except Exception:
+            pass
+
+    # 6. Recompile bootloader and initramfs images
+    has_grub = Path("/etc/grub.d").is_dir() and shutil.which("update-grub") is not None
+    compile_images(has_grub)
+
+    print()
+    print("=== SUCCESS ===")
+    print(
+        f"Hardware Hibernation Safeguard completely and surgically uninstalled by {installer_name}."
+    )
+    print("Boot images and bootloader configuration have been restored to default.")
 
 
 def show_status(installer_name=INSTALLER_NAME):
@@ -2397,6 +2576,11 @@ def main():
         help=f"Deploy and configure the hardware hibernation safeguard using {INSTALLER_NAME}.",
     )
     group.add_argument(
+        "--uninstall",
+        action="store_true",
+        help=f"Completely and surgically uninstall the hardware hibernation safeguard and any previous versions.",
+    )
+    group.add_argument(
         "--status",
         action="store_true",
         help=f"Check and display the current safeguard installation status and hardware targets.",
@@ -2406,6 +2590,8 @@ def main():
 
     if args.install:
         install(INSTALLER_NAME)
+    elif args.uninstall:
+        uninstall(INSTALLER_NAME)
     elif args.status:
         show_status(INSTALLER_NAME)
 
