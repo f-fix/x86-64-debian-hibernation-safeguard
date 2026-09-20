@@ -86,7 +86,7 @@ Hibernating Linux writes the complete active memory state and kernel registers t
 1. **Early Bootloader Validation (GRUB / systemd-boot):** Compares the machine's SMBIOS DMI information (vendor, model, BIOS version, baseboard, and processor) against the saved hibernation record before the kernel boots. Disables automatic timer countdowns, displays changed hardware attributes, and presents safe recovery options (Safe Power Off preselected, Clean Boot, and Force Resume).
 2. **Early Initramfs Validation:** Mounts `/boot` strictly read-only for a few milliseconds, immediately unmounts it, and validates Kernel version, DMI parameters, CPU model, numeric RAM capacity (with dynamic tolerance for stolen memory), and permanent hardware MAC addresses.
 3. **Safe Interactive Confirmation (Anti-Passphrase Leak):** Uses a dedicated compiled C evdev micro-daemon (`hibernation-resume-prompt`) as the primary interactive prompt in early initramfs, supporting both Plymouth splash screens (live in-place prompt line updates) and text consoles. Requires full words (`yes`, `no`, `force`) with **zero plaintext echoing** of passwords typed in error (any input that is not a case-insensitive prefix of `yes`, `no`, or `force` is masked as `*`, and Enter discards invalid input). If the C binary is missing, non-executable, or exits abnormally/crashes, a compact shell-based fallback (using `plymouth ask-question` or regular console input with normal text echo) prompts the user until a valid confirmation is entered.
-4. **Resilient Discard (LUKS, LVM, and Plain Swap):** Selecting discard neutralizes resume binaries, zeroes `/sys/power/resume`, and sanitizes swap suspend signatures (`S1SUSPEND`/`S2SUSPEND` -> `SWAPSPACE2`) on plain partitions and inside LUKS/LVM volumes once unlocked.
+4. **Resilient Discard (LUKS, LVM, and Plain Swap):** Selecting discard neutralizes resume binaries, zeroes `/sys/power/resume`, and sanitizes swap suspend signatures (`S1SUSPEND`/`S2SUSPEND` -> `SWAPSPACE2`) on plain partitions and inside LUKS/LVM volumes once unlocked. Additionally, if the kernel command line flag `noresume` (or `resume=none`) is passed at boot (such as via GRUB's clean boot entry), the initramfs validation stage immediately inhibits/bypasses all hardware checks and prompts, sanitizes swap signatures, and executes a clean boot.
 5. **Boot Mount Isolation & Strict Early Read-Only:** Attempts to sync dirty buffers and unmount `/boot/efi` (if present) and `/boot` immediately prior to hibernation, and attempts to remount them immediately after resumption. Strictly isolates `/boot` as read-only during GRUB and initramfs (never mounting rw or writing in early boot), and communicates state transitions safely via `/run` tmpfs.
 
 ---
@@ -1617,22 +1617,69 @@ if [ -n "$target_boot_part" ]; then
             menuentry "[SAFEGUARD] 2. Discard Hibernation Image & Boot Cleanly" --id=safeguard_clean {
                 echo "Loading kernel for clean boot (noresume)..."
                 search --no-floppy --fs-uuid --set=root __BOOT_UUID__
-                linux __KERNEL_DIR__/vmlinuz root=__ROOT_SPEC__ ro __DEFAULT_CMDLINE__ noresume
-                initrd __KERNEL_DIR__/initrd.img
-                boot
+                chosen_kernel=""
+                chosen_initrd=""
+                if [ -n "$SAVED_KERNEL_VERSION" ] && [ -f __KERNEL_DIR__/vmlinuz-$SAVED_KERNEL_VERSION ]; then
+                    chosen_kernel="__KERNEL_DIR__/vmlinuz-$SAVED_KERNEL_VERSION"
+                    chosen_initrd="__KERNEL_DIR__/initrd.img-$SAVED_KERNEL_VERSION"
+                elif [ -n "$SAVED_KERNEL_VERSION" ] && [ -f /boot/vmlinuz-$SAVED_KERNEL_VERSION ]; then
+                    chosen_kernel="/boot/vmlinuz-$SAVED_KERNEL_VERSION"
+                    chosen_initrd="/boot/initrd.img-$SAVED_KERNEL_VERSION"
+                elif [ -n "$SAVED_KERNEL_VERSION" ] && [ -f /vmlinuz-$SAVED_KERNEL_VERSION ]; then
+                    chosen_kernel="/vmlinuz-$SAVED_KERNEL_VERSION"
+                    chosen_initrd="/initrd.img-$SAVED_KERNEL_VERSION"
+__FALLBACK_KERNEL_CHECKS__
+                elif [ -f __KERNEL_DIR__/vmlinuz ]; then
+                    chosen_kernel="__KERNEL_DIR__/vmlinuz"
+                    chosen_initrd="__KERNEL_DIR__/initrd.img"
+                elif [ -f /boot/vmlinuz ]; then
+                    chosen_kernel="/boot/vmlinuz"
+                    chosen_initrd="/boot/initrd.img"
+                elif [ -f /vmlinuz ]; then
+                    chosen_kernel="/vmlinuz"
+                    chosen_initrd="/initrd.img"
+                fi
+                if [ -n "$chosen_kernel" ]; then
+                    linux $chosen_kernel root=__ROOT_SPEC__ ro __DEFAULT_CMDLINE__ noresume
+                    if [ -n "$chosen_initrd" ]; then
+                        initrd $chosen_initrd
+                    fi
+                    boot
+                fi
             }
 
             menuentry "[SAFEGUARD] 3. Force Resume Anyway (Dangerous - May Panic)" --id=safeguard_force {
                 echo "Loading kernel for forced resume..."
                 search --no-floppy --fs-uuid --set=root __BOOT_UUID__
-                if [ -n "$SAVED_KERNEL_VERSION" ]; then
-                    linux __KERNEL_DIR__/vmlinuz-$SAVED_KERNEL_VERSION root=__ROOT_SPEC__ ro __DEFAULT_CMDLINE__ __RESUME_PARAM__
-                    initrd __KERNEL_DIR__/initrd.img-$SAVED_KERNEL_VERSION
-                else
-                    linux __KERNEL_DIR__/vmlinuz root=__ROOT_SPEC__ ro __DEFAULT_CMDLINE__ __RESUME_PARAM__
-                    initrd __KERNEL_DIR__/initrd.img
+                chosen_kernel=""
+                chosen_initrd=""
+                if [ -n "$SAVED_KERNEL_VERSION" ] && [ -f __KERNEL_DIR__/vmlinuz-$SAVED_KERNEL_VERSION ]; then
+                    chosen_kernel="__KERNEL_DIR__/vmlinuz-$SAVED_KERNEL_VERSION"
+                    chosen_initrd="__KERNEL_DIR__/initrd.img-$SAVED_KERNEL_VERSION"
+                elif [ -n "$SAVED_KERNEL_VERSION" ] && [ -f /boot/vmlinuz-$SAVED_KERNEL_VERSION ]; then
+                    chosen_kernel="/boot/vmlinuz-$SAVED_KERNEL_VERSION"
+                    chosen_initrd="/boot/initrd.img-$SAVED_KERNEL_VERSION"
+                elif [ -n "$SAVED_KERNEL_VERSION" ] && [ -f /vmlinuz-$SAVED_KERNEL_VERSION ]; then
+                    chosen_kernel="/vmlinuz-$SAVED_KERNEL_VERSION"
+                    chosen_initrd="/initrd.img-$SAVED_KERNEL_VERSION"
+__FALLBACK_KERNEL_CHECKS__
+                elif [ -f __KERNEL_DIR__/vmlinuz ]; then
+                    chosen_kernel="__KERNEL_DIR__/vmlinuz"
+                    chosen_initrd="__KERNEL_DIR__/initrd.img"
+                elif [ -f /boot/vmlinuz ]; then
+                    chosen_kernel="/boot/vmlinuz"
+                    chosen_initrd="/boot/initrd.img"
+                elif [ -f /vmlinuz ]; then
+                    chosen_kernel="/vmlinuz"
+                    chosen_initrd="/initrd.img"
                 fi
-                boot
+                if [ -n "$chosen_kernel" ]; then
+                    linux $chosen_kernel root=__ROOT_SPEC__ ro __DEFAULT_CMDLINE__ __RESUME_PARAM__
+                    if [ -n "$chosen_initrd" ]; then
+                        initrd $chosen_initrd
+                    fi
+                    boot
+                fi
             }
 
             # Enforce preselected default to safe power off
@@ -1646,6 +1693,35 @@ if [ -n "$target_boot_part" ]; then
     fi
 fi
 __SENTINEL_END__"""
+    # Discover installed versioned kernels in /boot to ensure versioned GRUB references
+    installed_versions = []
+    curr_k = os.uname().release
+    if curr_k:
+        installed_versions.append(curr_k)
+
+    boot_dir = Path("/boot")
+    if boot_dir.is_dir():
+        for kfile in sorted(boot_dir.glob("vmlinuz-*"), reverse=True):
+            if kfile.is_file() and not kfile.is_symlink():
+                v = kfile.name[len("vmlinuz-") :].strip()
+                if v and v not in installed_versions:
+                    installed_versions.append(v)
+
+    fallback_checks = []
+    for v in installed_versions:
+        fallback_checks.append(
+            f"                elif [ -f __KERNEL_DIR__/vmlinuz-{v} ]; then\n"
+            f'                    chosen_kernel="__KERNEL_DIR__/vmlinuz-{v}"\n'
+            f'                    chosen_initrd="__KERNEL_DIR__/initrd.img-{v}"\n'
+            f"                elif [ -f /boot/vmlinuz-{v} ]; then\n"
+            f'                    chosen_kernel="/boot/vmlinuz-{v}"\n'
+            f'                    chosen_initrd="/boot/initrd.img-{v}"\n'
+            f"                elif [ -f /vmlinuz-{v} ]; then\n"
+            f'                    chosen_kernel="/vmlinuz-{v}"\n'
+            f'                    chosen_initrd="/initrd.img-{v}"'
+        )
+    fallback_checks_str = "\n".join(fallback_checks)
+
     safeguard_block = (
         template_block.replace("__SENTINEL_START__", sentinel_start)
         .replace("__SENTINEL_END__", sentinel_end)
@@ -1654,6 +1730,7 @@ __SENTINEL_END__"""
         .replace("__KERNEL_DIR__", kernel_dir)
         .replace("__DEFAULT_CMDLINE__", default_cmdline)
         .replace("__RESUME_PARAM__", resume_param)
+        .replace("__FALLBACK_KERNEL_CHECKS__", fallback_checks_str)
     )
 
     standard_header = """#!/bin/sh
@@ -1718,9 +1795,86 @@ case $1 in
     prereqs) prereqs; exit 0;;
 esac
 
-. /scripts/functions
+[ -f /scripts/functions ] && . /scripts/functions || true
 
 echo "=== Universal Hardware Hibernation Resume Validation ==="
+
+# 0. Check if resume is inhibited via kernel command line (noresume or resume=none/0:0)
+no_resume_requested=false
+for arg in $(cat /proc/cmdline 2>/dev/null); do
+    case "$arg" in
+        noresume|resume=none|resume=0:0)
+            no_resume_requested=true
+            ;;
+    esac
+done
+
+if [ "$no_resume_requested" = true ]; then
+    echo "Safeguard: 'noresume' detected on kernel command line. Bypassing hardware checks for clean boot."
+
+    for rbin in /bin/resume /usr/lib/systemd/systemd-hibernate-resume /lib/systemd/systemd-hibernate-resume; do
+        if [ -f "$rbin" ]; then
+            rm -f "$rbin" 2>/dev/null || { echo '#!/bin/sh'; echo 'exit 0'; } > "$rbin"
+        fi
+    done
+
+    rm -f /conf/conf.d/resume /conf/param.conf 2>/dev/null
+    mkdir -p /conf/conf.d
+    echo "RESUME=none" > /conf/conf.d/resume
+
+    if [ -e /sys/power/resume ]; then
+        echo "0:0" > /sys/power/resume 2>/dev/null || true
+    fi
+
+    mkdir -p /scripts/local-premount
+    cat << 'EOF_SAN' > /scripts/local-premount/resume
+#!/bin/sh
+# Sanitizer installed dynamically by __INSTALLER_NAME__ during clean boot / noresume
+PREREQ="udev"
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+
+echo "Safeguard Clean Boot: Sanitizing swap suspend signatures (LUKS/LVM/disk)..."
+modprobe dm-mod 2>/dev/null
+command -v lvm >/dev/null 2>&1 && lvm vgchange -ay 2>/dev/null
+
+sanitize_dev() {
+    dev="$1"
+    [ ! -b "$dev" ] && return
+    sig=$(dd if="$dev" bs=1 skip=4086 count=9 2>/dev/null)
+    if [ "$sig" = "S1SUSPEND" ] || [ "$sig" = "S2SUSPEND" ]; then
+        echo "Sanitizing swap suspend signature on $dev..."
+        printf 'SWAPSPACE2' | dd of="$dev" bs=1 seek=4086 count=10 conv=notrunc 2>/dev/null
+    fi
+}
+
+for d in $(awk '/\/dev\// {print $1}' /proc/swaps 2>/dev/null) \
+         $(blkid -t TYPE=suspend -o device 2>/dev/null) \
+         $(blkid -t TYPE=swsuspend -o device 2>/dev/null) \
+         $(blkid -t TYPE=swap -o device 2>/dev/null) \
+         /dev/mapper/* /dev/dm-*; do
+    sanitize_dev "$d"
+done
+
+[ -e /sys/power/resume ] && echo "0:0" > /sys/power/resume 2>/dev/null
+exit 0
+EOF_SAN
+    chmod +x /scripts/local-premount/resume
+
+    for d in /dev/mapper/* /dev/dm-* $(awk '/\/dev\// {print $1}' /proc/swaps 2>/dev/null); do
+        if [ -b "$d" ]; then
+            sig=$(dd if="$d" bs=1 skip=4086 count=9 2>/dev/null)
+            if [ "$sig" = "S1SUSPEND" ] || [ "$sig" = "S2SUSPEND" ]; then
+                printf 'SWAPSPACE2' | dd of="$d" bs=1 seek=4086 count=10 conv=notrunc 2>/dev/null || true
+            fi
+        fi
+    done
+
+    mkdir -p /run/hibernation-safeguard
+    echo "discard" > /run/hibernation-safeguard/action
+
+    exit 0
+fi
 
 BOOT_MNT="/tmp/boot_mnt"
 mkdir -p "$BOOT_MNT"
