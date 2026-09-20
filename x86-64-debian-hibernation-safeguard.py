@@ -586,6 +586,112 @@ int main(int argc, char **argv) {
 """
 
 
+PROTECTED_FAN_DAEMON_PATTERNS = [
+    "gpd-win-2",
+    "gpd_win_2",
+    "gpd-pocket-3",
+    "gpd_pocket_3",
+    "nbfc",
+    "gpd-win-2-governor",
+    "gpd-pocket-3-i7-1195G7-governor",
+    "gpd-win-2-lowpower",
+    "gpd-pocket-3-i7-1195G7-lowpower",
+    "gpd-win-2-power-watchdog",
+    "gpd-pocket-3-power-watchdog",
+    "gpd-win-2-sleep",
+    "gpd-win-2-nbfc-prestart",
+    "coretemp",
+    "ec_sys",
+]
+
+
+def is_protected_fan_daemon_path(path):
+    p_str = str(path).lower()
+    return any(pat.lower() in p_str for pat in PROTECTED_FAN_DAEMON_PATTERNS)
+
+
+GRUBENV_HEADER = b"# GRUB Environment Block\n"
+GRUBENV_SIZE = 1024
+
+
+def is_valid_grubenv(raw: bytes) -> bool:
+    return len(raw) == GRUBENV_SIZE and raw.startswith(GRUBENV_HEADER)
+
+
+def repair_grub_environment_block():
+    """Validates and restores any corrupted GRUB environment blocks across standard paths."""
+    candidates = [
+        Path("/boot/grub/grubenv"),
+        Path("/boot/grub2/grubenv"),
+        Path("/boot/efi/EFI/debian/grubenv"),
+        Path("/efi/EFI/debian/grubenv"),
+        Path("/boot/efi/EFI/BOOT/grubenv"),
+    ]
+
+    for genv in candidates:
+        needs_repair = False
+        raw = b""
+        if genv.exists():
+            try:
+                raw = genv.read_bytes()
+                if not is_valid_grubenv(raw):
+                    needs_repair = True
+            except Exception:
+                needs_repair = True
+        elif (
+            genv.parent.is_dir()
+            and genv.name == "grubenv"
+            and genv.parent.name in ["grub", "grub2"]
+        ):
+            needs_repair = True
+
+        if needs_repair:
+            print(
+                f"  [GRUBENV] Repairing corrupted or missing GRUB environment block at {genv}..."
+            )
+            ensure_boot_rw()
+            genv.parent.mkdir(parents=True, exist_ok=True)
+
+            repaired_with_tool = False
+            if shutil.which("grub-editenv"):
+                try:
+                    subprocess.run(
+                        ["grub-editenv", str(genv), "create"],
+                        check=True,
+                        capture_output=True,
+                    )
+                    repaired_with_tool = True
+                except Exception:
+                    repaired_with_tool = False
+
+            if not repaired_with_tool:
+                salvaged = []
+                if raw:
+                    for line in raw.splitlines():
+                        sline = line.strip()
+                        if sline and not sline.startswith(b"#") and b"=" in sline:
+                            salvaged.append(sline)
+
+                content = GRUBENV_HEADER
+                for v in salvaged:
+                    if len(content) + len(v) + 1 <= GRUBENV_SIZE:
+                        content += v + b"\n"
+
+                if len(content) < GRUBENV_SIZE:
+                    content += b"#" * (GRUBENV_SIZE - len(content))
+
+                try:
+                    genv.write_bytes(content[:GRUBENV_SIZE])
+                    genv.chmod(0o644)
+                    print(
+                        f"  [GRUBENV] Successfully restored valid 1024-byte environment block at {genv}."
+                    )
+                except Exception as e:
+                    sys.stderr.write(
+                        f"Warning: could not write repaired grubenv at {genv}: {e}\n"
+                    )
+
+
 def ensure_boot_rw():
     for mount_target in ["/boot", "/boot/efi", "/efi"]:
         if Path(mount_target).is_mount() or Path(mount_target).is_dir():
@@ -774,7 +880,9 @@ def cleanup_legacy_artifacts():
         "=== Cleaning Up Artifacts and Legacy Guard Sections From Previous Iterations ==="
     )
     ensure_boot_rw()
+    repair_grub_environment_block()
 
+    # Explicit legacy files from previous iterations of this hibernation safeguard ONLY
     stale_paths = [
         Path("/etc/grub.d/08_hibernation_safeguard"),
         Path("/etc/default/grub.d/99-hibernation-safeguard.cfg"),
@@ -787,7 +895,6 @@ def cleanup_legacy_artifacts():
         Path("/boot/initramfs_hib_id"),
         Path("/boot/loader/gpd_sdboot_hib_id"),
         Path("/boot/loader/sdboot_hib_id"),
-        Path("/run/gpd/initramfs_id"),
         Path("/run/hibernation-safeguard"),
         Path("/tmp/gpd_ply_key"),
         Path("/tmp/hib_ply_key"),
@@ -795,18 +902,26 @@ def cleanup_legacy_artifacts():
         Path("/root/deploy_hibernation_safeguard.py"),
     ]
 
+    # Only glob safeguard-specific names; NEVER glob generic *gpd* which breaks fan control daemons
     for gpath in (
         list(Path("/etc/grub.d").glob("*hibernation_safeguard*"))
-        + list(Path("/etc/grub.d").glob("*gpd*"))
-        + list(Path("/etc/default/grub.d").glob("*hibernation*"))
-        + list(Path("/etc/default/grub.d").glob("*gpd*"))
-        + list(Path("/etc/initramfs-tools/hooks").glob("*gpd*"))
-        + list(Path("/etc/initramfs-tools/scripts/local-top").glob("*gpd*"))
-        + list(Path("/etc/initramfs-tools/conf.d").glob("*gpd*"))
+        + list(Path("/etc/grub.d").glob("*hibernation-safeguard*"))
+        + list(Path("/etc/default/grub.d").glob("*hibernation_safeguard*"))
+        + list(Path("/etc/default/grub.d").glob("*hibernation-safeguard*"))
+        + list(Path("/etc/initramfs-tools/hooks").glob("*hibernation_safeguard*"))
+        + list(
+            Path("/etc/initramfs-tools/scripts/local-top").glob(
+                "*hibernation_resume_check*"
+            )
+        )
     ):
         stale_paths.append(gpath)
 
     for p in set(stale_paths):
+        # Strict safety check: Never delete or touch files belonging to fan control daemons
+        if is_protected_fan_daemon_path(p):
+            continue
+
         if p.exists():
             if p.is_file() or p.is_symlink():
                 try:
@@ -826,16 +941,7 @@ def cleanup_legacy_artifacts():
                 except OSError as e:
                     sys.stderr.write(f"Warning: could not remove directory {p}: {e}\n")
 
-    legacy_run_dir = Path("/run/gpd")
-    if legacy_run_dir.exists() and legacy_run_dir.is_dir():
-        try:
-            shutil.rmtree(legacy_run_dir)
-            print(f"Removed legacy directory: {legacy_run_dir}")
-        except OSError as e:
-            sys.stderr.write(
-                f"Warning: could not remove directory {legacy_run_dir}: {e}\n"
-            )
-
+    # Purge safeguard sentinel comments from /etc/initramfs-tools/modules without touching fan control blocks
     modules_file = Path("/etc/initramfs-tools/modules")
     if modules_file.exists():
         content = modules_file.read_text()
@@ -1175,7 +1281,25 @@ SAVED_MAC_IFACE="$IFACE_STR"
 SAVED_KERNEL="$CURRENT_KERNEL"
 EOF_RUN
 
+repair_grubenv_if_corrupted() {
+    for _genv in /boot/grub/grubenv /boot/grub2/grubenv /boot/efi/EFI/debian/grubenv /efi/EFI/debian/grubenv; do
+        if [ -f "$_genv" ]; then
+            _sz=$(wc -c < "$_genv" 2>/dev/null | tr -d ' ')
+            _hdr=$(head -n 1 "$_genv" 2>/dev/null)
+            if [ "$_sz" != "1024" ] || [ "$_hdr" != "# GRUB Environment Block" ]; then
+                if command -v grub-editenv >/dev/null 2>&1; then
+                    grub-editenv "$_genv" create 2>/dev/null || true
+                else
+                    printf "# GRUB Environment Block\n" > "$_genv" 2>/dev/null
+                    awk 'BEGIN { for (i = 25; i < 1024; i++) printf "#"; }' >> "$_genv" 2>/dev/null || true
+                fi
+            fi
+        fi
+    done
+}
+
 if [ "$1" = "save-targets" ]; then
+    repair_grubenv_if_corrupted
     _was_ro=0
     if mountpoint -q /boot 2>/dev/null; then
         if grep -qE '[[:space:]]/boot[[:space:]]+[^ ]+[[:space:]]+([^ ]*,)?ro[, ]' /proc/mounts 2>/dev/null; then
@@ -1246,6 +1370,7 @@ EOF_GRUB
 fi
 
 if [ "$1" = "clear-targets" ]; then
+    repair_grubenv_if_corrupted
     _was_ro=0
     if mountpoint -q /boot 2>/dev/null; then
         if grep -qE '[[:space:]]/boot[[:space:]]+[^ ]+[[:space:]]+([^ ]*,)?ro[, ]' /proc/mounts 2>/dev/null; then
@@ -1292,16 +1417,14 @@ fi
     helper_path.write_text(helper_content)
     helper_path.chmod(0o755)
 
+    # Only remove legacy helper symlink if it was an artifact pointing to our helper
     legacy_helper = Path("/usr/local/bin/gpd-machine-id")
-    if legacy_helper.exists() or legacy_helper.is_symlink():
+    if legacy_helper.is_symlink():
         try:
-            legacy_helper.unlink()
+            if "hibernation-machine-id" in str(legacy_helper.resolve()):
+                legacy_helper.unlink()
         except OSError:
             pass
-    try:
-        legacy_helper.symlink_to(helper_path)
-    except OSError:
-        pass
 
 
 def write_systemd_sleep_hook(installer_name=INSTALLER_NAME):
@@ -2158,6 +2281,7 @@ def install(installer_name=INSTALLER_NAME):
             pass
 
     cleanup_legacy_artifacts()
+    repair_grub_environment_block()
     (
         boot_dev,
         boot_uuid,
@@ -2203,15 +2327,16 @@ def uninstall(installer_name=INSTALLER_NAME):
     print()
     ensure_boot_rw()
 
-    # 1. Clean up legacy artifacts from previous iterations (including gpd_include_script)
+    # 1. Clean up legacy artifacts from previous iterations (strictly avoiding fan control daemons)
     cleanup_legacy_artifacts()
 
-    # 2. Remove all active safeguard files
+    # 2. Repair any corrupted GRUB environment block so uninstallation leaves GRUB in clean working order
+    repair_grub_environment_block()
+
+    # 3. Remove only safeguard installed files
     active_paths = [
         Path("/usr/local/bin/hibernation-machine-id"),
-        Path("/usr/local/bin/gpd-machine-id"),
         Path("/lib/systemd/system-sleep/hibernation-hardware-tag"),
-        Path("/lib/systemd/system-sleep/gpd-hibernation-hardware-tag"),
         Path("/lib/systemd/system/hibernation-safeguard-cleanup.service"),
         Path(
             "/etc/systemd/system/basic.target.wants/hibernation-safeguard-cleanup.service"
@@ -2219,20 +2344,18 @@ def uninstall(installer_name=INSTALLER_NAME):
         Path("/usr/local/bin/hibernation-resume-prompt"),
         Path("/usr/local/src/hibernation-resume-prompt.c"),
         Path("/etc/initramfs-tools/scripts/local-top/hibernation_resume_check"),
-        Path("/etc/initramfs-tools/scripts/local-top/gpd_resume_check"),
         Path("/etc/initramfs-tools/hooks/hibernation_safeguard_tools"),
-        Path("/etc/initramfs-tools/hooks/gpd_include_script"),
         Path("/etc/initramfs-tools/conf.d/zz-hibernation-safeguard.conf"),
-        Path("/etc/initramfs-tools/conf.d/zz-gpd-hibernation.conf"),
         Path("/boot/grub_hib_id"),
         Path("/boot/initramfs_hib_id"),
         Path("/boot/loader/sdboot_hib_id"),
-        Path("/boot/loader/gpd_sdboot_hib_id"),
         Path("/run/hibernation-safeguard"),
-        Path("/run/gpd"),
     ]
 
     for p in active_paths:
+        if is_protected_fan_daemon_path(p):
+            continue
+
         if p.exists() or p.is_symlink():
             if p.is_dir():
                 try:
@@ -2252,7 +2375,7 @@ def uninstall(installer_name=INSTALLER_NAME):
                     except OSError as e2:
                         sys.stderr.write(f"Warning: could not remove file {p}: {e2}\n")
 
-    # 3. Clean sentinel blocks from /etc/initramfs-tools/modules
+    # 4. Clean sentinel blocks from /etc/initramfs-tools/modules (safeguard blocks ONLY)
     modules_file = Path("/etc/initramfs-tools/modules")
     if modules_file.exists():
         content = modules_file.read_text()
@@ -2264,7 +2387,7 @@ def uninstall(installer_name=INSTALLER_NAME):
                 "Purged safeguard sentinel comments from /etc/initramfs-tools/modules"
             )
 
-    # 4. Clean sentinel and legacy blocks from /etc/grub.d/40_custom
+    # 5. Clean sentinel and legacy blocks from /etc/grub.d/40_custom
     custom_path = Path("/etc/grub.d/40_custom")
     if custom_path.exists():
         content = custom_path.read_text()
@@ -2283,7 +2406,7 @@ def uninstall(installer_name=INSTALLER_NAME):
             custom_path.write_text(cleaned)
             print("Purged safeguard configuration blocks from /etc/grub.d/40_custom")
 
-    # 5. Reset systemd-boot default if needed
+    # 6. Reset systemd-boot default if needed
     if shutil.which("bootctl"):
         try:
             run_command(
@@ -2292,7 +2415,7 @@ def uninstall(installer_name=INSTALLER_NAME):
         except Exception:
             pass
 
-    # 6. Recompile bootloader and initramfs images
+    # 7. Recompile bootloader and initramfs images
     has_grub = Path("/etc/grub.d").is_dir() and shutil.which("update-grub") is not None
     compile_images(has_grub)
 
@@ -2480,6 +2603,18 @@ def show_status(installer_name=INSTALLER_NAME):
                     break
 
     print(f"  - Permanent MAC   : {mac} (interface: {mac_iface})")
+    print()
+
+    grubenv_path = Path("/boot/grub/grubenv")
+    grubenv_ok = False
+    if grubenv_path.is_file():
+        try:
+            grubenv_ok = is_valid_grubenv(grubenv_path.read_bytes())
+        except Exception:
+            grubenv_ok = False
+    print(
+        f"  - GRUB environment block (/boot/grub/grubenv)            : {'[VALID 1024B]' if grubenv_ok else '[MISSING/CORRUPTED]'}"
+    )
     print()
 
     print("Saved Hibernation Targets:")
